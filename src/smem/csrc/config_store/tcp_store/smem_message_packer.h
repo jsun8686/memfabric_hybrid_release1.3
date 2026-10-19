@@ -110,6 +110,8 @@ struct SmemMessage {
 
     static SmemMessage PackLinkStateResponse(const RankFullInfo &rankInfo,
                                              const std::vector<LinkStateEntry> &entries) noexcept;
+    // The trailing role tag is mandatory: every peer sends it, a missing tag means the payload is
+    // truncated, in which case unpacking fails instead of silently degrading a known role.
     static int64_t UnpackLinkStateResponse(const SmemMessage &msg, RankFullInfo &rankInfo,
                                            std::vector<LinkStateEntry> &entries) noexcept;
 

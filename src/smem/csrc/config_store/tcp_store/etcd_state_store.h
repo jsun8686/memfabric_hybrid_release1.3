@@ -50,6 +50,7 @@ public:
     StoreErrorCode PersistAliveRanks(const std::unordered_set<uint32_t> &alive) noexcept;
     StoreErrorCode PersistRankBase(uint32_t rankId, const Bytes &data) noexcept;
     StoreErrorCode PersistRankExternal(uint32_t rankId, const std::vector<Bytes> &data) noexcept;
+    StoreErrorCode PersistRankRoles(const std::vector<uint8_t> &roles, uint32_t maxRanks) noexcept;
     StoreErrorCode DeleteRank(uint32_t rankId) noexcept;
 
     // ── C2: 链接状态 · 异步批量写入 ──
@@ -65,6 +66,7 @@ public:
     StoreErrorCode LoadLinks(std::vector<LinkState> &links, uint32_t &maxRanks) noexcept;
     StoreErrorCode LoadRankBase(uint32_t rankId, Bytes &data) noexcept;
     StoreErrorCode LoadRankExternal(uint32_t rankId, std::vector<Bytes> &data) noexcept;
+    StoreErrorCode LoadRankRoles(std::vector<uint8_t> &roles, uint32_t &maxRanks) noexcept;
 
     // ── 恢复完整流程（供 AccStoreServer 调用） ──
 
@@ -80,6 +82,7 @@ private:
     static constexpr auto keyStates = "/memfabric_hybrid/group_manager/states";
     static constexpr auto keyAlive = "/memfabric_hybrid/group_manager/alive_ranks";
     static constexpr auto keyLinks = "/memfabric_hybrid/group_manager/links";
+    static constexpr auto keyRoles = "/memfabric_hybrid/group_manager/roles";
     static constexpr auto keyRankPrefix = "/memfabric_hybrid/group_manager/ranks/";
 
     static constexpr int64_t linksTtlSec = 30;
@@ -92,6 +95,11 @@ private:
                                           std::vector<uint8_t> &out) noexcept;
     static StoreErrorCode DeserializeStates(const std::vector<uint8_t> &data, std::vector<RankState> &states,
                                             uint32_t &maxRanks) noexcept;
+    // 角色与 states/links 一样按“单个 blob”序列化：恢复时只需 1 次 etcd GET，耗时与 alive rank 数无关。
+    static StoreErrorCode SerializeRoles(const std::vector<uint8_t> &roles, uint32_t maxRanks,
+                                         std::vector<uint8_t> &out) noexcept;
+    static StoreErrorCode DeserializeRoles(const std::vector<uint8_t> &data, std::vector<uint8_t> &roles,
+                                           uint32_t &maxRanks) noexcept;
     static StoreErrorCode SerializeLinks(const std::vector<LinkState> &links, uint32_t maxRanks,
                                          std::vector<uint8_t> &out) noexcept;
     static StoreErrorCode DeserializeLinks(const std::vector<uint8_t> &data, std::vector<LinkState> &links,

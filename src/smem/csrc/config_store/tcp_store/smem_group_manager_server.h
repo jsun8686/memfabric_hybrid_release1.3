@@ -148,7 +148,8 @@ public:
      * @brief Apply a link-state response from a rank.
      *
      * Called when a LINK_STATE_RESPONSE message is received from a rank.
-     * Updates the in-memory link-state matrix for the responding rank.
+     * Updates the in-memory link-state matrix for the responding rank, and backfills the
+     * role carried by the response.
      */
     void OnLinkStateResponse(const RankFullInfo &rankInfo, const std::vector<LinkStateEntry> &entries,
                              uint64_t reqId = 0) noexcept;
@@ -230,6 +231,20 @@ public:
         transitions = transitions_;
     }
 
+    /**
+     * @brief 四参数重载：额外拷贝每 rank 的角色，供集群状态统计剔除剪枝对
+     * （PROXY<->PROXY 不建链，不应被报成异常/未完成）。锁语义与三参数版本一致。
+     */
+    void GetSnapshot(std::vector<RankState> &states, std::vector<LinkState> &links,
+                     std::vector<LinkTransition> &transitions, std::vector<uint8_t> &roles) const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        states = states_;
+        links = links_;
+        transitions = transitions_;
+        roles = rankRole_;
+    }
+
     // ── 状态恢复（供 EtcdStateStore 使用） ──
 
     void RestoreState(const std::vector<RankState> &states, const std::vector<LinkState> &links,
@@ -237,6 +252,12 @@ public:
     void RestoreState(const std::vector<RankState> &states, const std::unordered_set<uint32_t> &alive) noexcept;
     void SetRankBase(uint32_t rankId, const Bytes &data) noexcept;
     void SetRankExternal(uint32_t rankId, const std::vector<Bytes> &data) noexcept;
+    // 恢复路径使用：把持久化的 rank 角色写回状态机，保证重启后 PROXY<->PROXY 剪枝仍然生效。
+    void SetRankRole(uint32_t rankId, uint8_t role) noexcept;
+    uint8_t GetRankRole(uint32_t rankId) const noexcept;
+    // 批量版本：恢复时一次持锁写入全部角色（避免 N 次加锁），持久化时一次持锁拷出全部角色。
+    void SetRankRoles(const std::vector<uint8_t> &roles) noexcept;
+    std::vector<uint8_t> GetRoles() const noexcept;
     void RebuildActiveLinks() noexcept;
 
     // ── 状态变更回调（供 AccStoreServer 监听内部状态变化） ──
@@ -274,6 +295,8 @@ private:
     };
 
     static bool IsStableLinkState(LinkState st) noexcept;
+    // PROXY<->PROXY 之间不建链（分离部署剪枝）；其余角色组合保持全互联。
+    [[nodiscard]] bool IsLinkPruned(uint32_t a, uint32_t b) const noexcept;
     void AddActiveLink(size_t idx) noexcept;
     void RemoveActiveLinksForRank(uint32_t rankId) noexcept;
     void DrivePendingTransitions() noexcept;
@@ -341,6 +364,7 @@ private:
     std::vector<LinkTransition> transitions_;      // parallel to links_, tracks timestamp & retry
     std::vector<Bytes> rankBase_;                  // base info per rank (e.g. endpoint)
     std::vector<std::vector<Bytes>> rankExternal_; // external addresses per rank
+    std::vector<uint8_t> rankRole_;                // SMEM_GROUP_RANK_ROLE_* per rank (link-mesh pruning)
     std::vector<bool> isActiveLink_;               // parallel to links_, marks presence in activeLinks_
     std::vector<size_t> activeLinks_;              // current non-stable link indices for O(1) scan
     std::unordered_set<uint32_t> aliveRanks_;

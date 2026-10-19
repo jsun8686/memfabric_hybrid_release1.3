@@ -88,6 +88,14 @@ protected:
         info.externalInfo.push_back(Bytes{static_cast<uint8_t>(rankId)});
         return info;
     }
+
+    /* 分离部署：带 rank 角色的 JOINREQ（默认角色即普通 BM rank） */
+    static RankFullInfo MakeInfoWithRole(uint32_t rankId, uint8_t role)
+    {
+        RankFullInfo info = MakeInfo(rankId);
+        info.role = role;
+        return info;
+    }
 };
 
 /* ================================================================== */
@@ -744,6 +752,147 @@ TEST_F(GroupManagerTest, RebuildActiveLinks_NoCrash)
 {
     gm_->RebuildActiveLinks();
     SUCCEED();
+}
+
+/* ================================================================== */
+/*  分离部署链路剪枝：PROXY<->PROXY 不建链，其余角色组合保持全互联      */
+/* ================================================================== */
+
+TEST_F(GmGroupManagerTest, ProxyProxyPair_NoLinkEstablished)
+{
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(0, SMEM_GROUP_RANK_ROLE_PROXY)), 0);
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(1, SMEM_GROUP_RANK_ROLE_PROXY)), 0);
+
+    /* 两个 PROXY 之间双向都不建链，链路保持 IDLE */
+    EXPECT_EQ(GetLink(0, 1), LINK_IDLE);
+    EXPECT_EQ(GetLink(1, 0), LINK_IDLE);
+    /* 角色随 JOINREQ 落库，供后续重连/恢复判定使用 */
+    EXPECT_EQ(gm_->GetRankRole(0), SMEM_GROUP_RANK_ROLE_PROXY);
+    EXPECT_EQ(gm_->GetRankRole(1), SMEM_GROUP_RANK_ROLE_PROXY);
+}
+
+TEST_F(GmGroupManagerTest, ProxyDefaultPair_LinksEstablished)
+{
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(0, SMEM_GROUP_RANK_ROLE_PROXY)), 0);
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(1, SMEM_GROUP_RANK_ROLE_PROVIDER)), 0);
+
+    /* 只有 PROXY<->PROXY 被剪枝：PROXY<->PROVIDER 仍然双向建链 */
+    EXPECT_EQ(GetLink(0, 1), LINK_EXCHANGING);
+    EXPECT_EQ(GetLink(1, 0), LINK_EXCHANGING);
+}
+
+TEST_F(GmGroupManagerTest, ProxyPromotesToActive_WithoutProxyProxyLink)
+{
+    /* 回归：剪枝对必须从“期望链路数”里扣除，否则 PROXY rank 会因为缺少
+     * PROXY<->PROXY 链路而永远停留在 CHECKED_IN，Join 超时。 */
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(0, SMEM_GROUP_RANK_ROLE_PROXY)), 0);
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(1, SMEM_GROUP_RANK_ROLE_PROXY)), 0);
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(K_RANK_TWO, SMEM_GROUP_RANK_ROLE_PROVIDER)), 0);
+
+    std::vector<RankState> states(K_RANK_COUNT, RANK_IDLE);
+    states[0] = RANK_CHECKED_IN;
+    states[1] = RANK_CHECKED_IN;
+    states[K_RANK_TWO] = RANK_CHECKED_IN;
+    std::vector<LinkState> links(K_RANK_COUNT * K_RANK_COUNT, LINK_IDLE);
+    /* rank1 与 rank0 是剪枝对（保持 IDLE）；rank1 与 rank2 已 CONNECTED */
+    links[1 * K_RANK_COUNT + K_RANK_TWO] = LINK_CONNECTED;
+    links[K_RANK_TWO * K_RANK_COUNT + 1] = LINK_CONNECTED;
+    std::unordered_set<uint32_t> alive{0, 1, K_RANK_TWO};
+    gm_->RestoreState(states, links, alive);
+    gm_->RebuildActiveLinks();
+
+    gm_->Start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(K_WAIT_MS));
+    gm_->Stop();
+    EXPECT_EQ(GetRank(1), RANK_ACTIVE);
+}
+
+TEST_F(GmGroupManagerTest, RestoreProxyPair_ForcesIdleAndStaysIdle)
+{
+    /* 恢复路径：即便持久化数据里存在 PROXY<->PROXY 的非 IDLE 链路，
+     * 也必须被强制回 IDLE，且不进入活跃扫描表。 */
+    std::vector<RankState> states(K_RANK_COUNT, RANK_IDLE);
+    states[0] = RANK_ACTIVE;
+    states[1] = RANK_ACTIVE;
+    std::vector<LinkState> links(K_RANK_COUNT * K_RANK_COUNT, LINK_IDLE);
+    links[0 * K_RANK_COUNT + 1] = LINK_EXCHANGING;
+    links[1 * K_RANK_COUNT + 0] = LINK_CONNECTED;
+    std::unordered_set<uint32_t> alive{0, 1};
+    gm_->RestoreState(states, links, alive);
+    gm_->SetRankRole(0, SMEM_GROUP_RANK_ROLE_PROXY);
+    gm_->SetRankRole(1, SMEM_GROUP_RANK_ROLE_PROXY);
+    gm_->RebuildActiveLinks();
+    EXPECT_EQ(GetLink(0, 1), LINK_IDLE);
+    EXPECT_EQ(GetLink(1, 0), LINK_IDLE);
+
+    /* 对端上报的链路状态同样不能把剪枝对重新拉起 */
+    RankFullInfo info = MakeInfoWithRole(1, SMEM_GROUP_RANK_ROLE_PROXY);
+    LinkStateEntry e;
+    e.dstRankId = 0;
+    e.state = static_cast<uint8_t>(LINK_CONNECTED);
+    gm_->OnLinkStateResponse(info, {e}, 0);
+    EXPECT_EQ(GetLink(1, 0), LINK_IDLE);
+}
+
+TEST_F(GmGroupManagerTest, IdleRetry_KeepsPrunedPairIdleButArmsOtherLinks)
+{
+    /* 回归：30s 一次的断链重试（RetryIdleLinks）不能把剪枝对重新拉起。
+     * 首次 DrivePendingTransitions 必定执行一次 idle 重试（lastIdleRetryTime_ 初值为 epoch），
+     * 因此同时断言“非剪枝的 IDLE 链路被拉起”，证明这次重试确实跑过（避免断言假通过）。 */
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(0, SMEM_GROUP_RANK_ROLE_PROXY)), 0);
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(1, SMEM_GROUP_RANK_ROLE_PROXY)), 0);
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(K_RANK_TWO, SMEM_GROUP_RANK_ROLE_PROVIDER)), 0);
+
+    std::vector<RankState> states(K_RANK_COUNT, RANK_IDLE);
+    states[0] = RANK_CHECKED_IN;
+    states[1] = RANK_CHECKED_IN;
+    states[K_RANK_TWO] = RANK_CHECKED_IN;
+    std::vector<LinkState> links(K_RANK_COUNT * K_RANK_COUNT, LINK_IDLE);
+    std::unordered_set<uint32_t> alive{0, 1, K_RANK_TWO};
+    gm_->RestoreState(states, links, alive);
+    gm_->RebuildActiveLinks();
+
+    gm_->Start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(K_WAIT_MS));
+    gm_->Stop();
+
+    /* 剪枝对：双方都存活也不允许被重新拉起 */
+    EXPECT_EQ(GetLink(0, 1), LINK_IDLE);
+    EXPECT_EQ(GetLink(1, 0), LINK_IDLE);
+    /* 非剪枝的 IDLE 链路（PROXY<->DEFAULT）被重试拉起 */
+    EXPECT_EQ(GetLink(0, K_RANK_TWO), LINK_EXCHANGING);
+}
+
+TEST_F(GmGroupManagerTest, ResetRankState_ClearsRole)
+{
+    ASSERT_EQ(gm_->CheckIn(MakeInfoWithRole(0, SMEM_GROUP_RANK_ROLE_PROXY)), 0);
+    EXPECT_EQ(gm_->GetRankRole(0), SMEM_GROUP_RANK_ROLE_PROXY);
+
+    /* 退出后角色清为未知（不再声称其贡献内存），避免下一次以其它角色加入时沿用旧角色导致误剪枝 */
+    ASSERT_EQ(gm_->Checkout(0), 0);
+    EXPECT_EQ(gm_->GetRankRole(0), SMEM_GROUP_RANK_ROLE_UNKNOWN);
+}
+
+TEST_F(GmGroupManagerTest, OnLinkStateResponse_BackfillsRoleFromPeer)
+{
+    /* 非 etcd 模式下 meta 重启：rank 以 rec:1 重连（不发 JOINREQ），角色只能靠
+       LNKSRSP 回带；回填后剪枝判定必须立即生效。 */
+    gm_->MarkRankReconnected(0);
+    gm_->MarkRankReconnected(1);
+    gm_->SetRankRole(0, SMEM_GROUP_RANK_ROLE_PROXY);
+    EXPECT_EQ(GetRank(0), RANK_ACTIVE);
+    EXPECT_EQ(GetRank(1), RANK_ACTIVE);
+    EXPECT_EQ(gm_->GetRankRole(1), SMEM_GROUP_RANK_ROLE_UNKNOWN);
+
+    RankFullInfo info = MakeInfoWithRole(1, SMEM_GROUP_RANK_ROLE_PROXY);
+    LinkStateEntry e;
+    e.dstRankId = 0;
+    e.state = static_cast<uint8_t>(LINK_CONNECTED);
+    gm_->OnLinkStateResponse(info, {e}, 0);
+
+    EXPECT_EQ(gm_->GetRankRole(1), SMEM_GROUP_RANK_ROLE_PROXY);
+    /* 角色回填后，剪枝对即便对端上报 CONNECTED 也必须被强制回 IDLE */
+    EXPECT_EQ(GetLink(1, 0), LINK_IDLE);
 }
 
 } // namespace smem

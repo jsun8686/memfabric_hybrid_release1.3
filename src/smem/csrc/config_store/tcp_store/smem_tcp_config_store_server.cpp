@@ -1717,6 +1717,10 @@ Result AccStoreServer::HandleControlJoin(const ock::acc::AccTcpRequestContext &c
         if (r != StoreErrorCode::SUCCESS) {
             STORE_LOG_ERROR("etcd persist rank ext failed: " << static_cast<int>(r));
         }
+        r = etcdStore_->PersistRankRoles(groupManager_->GetRoles(), groupManager_->GetMaxRanks());
+        if (r != StoreErrorCode::SUCCESS) {
+            STORE_LOG_ERROR("etcd persist rank roles failed: " << static_cast<int>(r));
+        }
         auto alive = groupManager_->GetAliveRanks();
         r = etcdStore_->PersistAliveRanks(std::unordered_set<uint32_t>(alive.begin(), alive.end()));
         if (r != StoreErrorCode::SUCCESS) {
@@ -1980,6 +1984,26 @@ bool IsMiddleStateLink(LinkState st) noexcept
     return st == LINK_EXCHANGING || st == LINK_EXCHANGED || st == LINK_CONNECTING;
 }
 
+// 分离部署下 PROXY<->PROXY 不建链：统计链路数/异常链路时必须剔除，否则该对会被永久报成
+// “双端存活却 IDLE”的异常，completionRate 也永远达不到 1。
+bool IsPrunedPair(const AccStoreServer::ClusterStatusSnapshot &snap, uint32_t src, uint32_t dst) noexcept
+{
+    if (snap.roles.size() < snap.maxRanks) {
+        return false; // 旧快照无角色信息：保持原统计口径
+    }
+    return snap.roles[src] == SMEM_GROUP_RANK_ROLE_PROXY && snap.roles[dst] == SMEM_GROUP_RANK_ROLE_PROXY;
+}
+
+// 期望链路数（方向性）= ACTIVE rank 的有向对数 − PROXY<->PROXY 的有向对数（剪枝对不建链）。
+// 快照缺角色信息时 activeProxyRanks 为 0，公式自然退化为历史口径 activeRanks*(activeRanks-1)，无需单独分支。
+uint64_t ExpectedLinks(uint32_t activeRanks, uint32_t activeProxyRanks) noexcept
+{
+    const auto directedPairs = [](uint32_t n) -> uint64_t {
+        return (n < 2U) ? 0U : static_cast<uint64_t>(n) * (n - 1U);
+    };
+    return directedPairs(activeRanks) - directedPairs(activeProxyRanks);
+}
+
 // 单次遍历链路矩阵（数据取自集群状态快照），同时产出 connected/abnormal 计数与 unstable 明细
 LinkSummary CollectLinkSummary(const AccStoreServer::ClusterStatusSnapshot &snap,
                                const std::chrono::steady_clock::time_point &now) noexcept
@@ -1989,6 +2013,9 @@ LinkSummary CollectLinkSummary(const AccStoreServer::ClusterStatusSnapshot &snap
         for (uint32_t dst = 0; dst < snap.maxRanks; ++dst) {
             if (src == dst) {
                 continue; // 对角线无链路语义
+            }
+            if (IsPrunedPair(snap, src, dst)) {
+                continue; // 剪枝对：既不计 connected，也不计 abnormal/unstable
             }
             const size_t idx = static_cast<size_t>(src) * snap.maxRanks + dst;
             const LinkState st = snap.links[idx];
@@ -2018,11 +2045,11 @@ LinkSummary CollectLinkSummary(const AccStoreServer::ClusterStatusSnapshot &snap
     return summary;
 }
 
-// linkSummary 摘要输出：expectedLinks 以 activeRanks 为基数（未 join 完成时不用 worldSize 压低完成率）
-void AppendLinkSummaryJson(std::string &out, uint32_t activeRanks, uint32_t connectedLinks,
+// linkSummary 摘要输出：expectedLinks 以 activeRanks 为基数（未 join 完成时不用 worldSize 压低完成率），
+// 并已扣除 PROXY<->PROXY 剪枝对
+void AppendLinkSummaryJson(std::string &out, uint32_t activeRanks, uint64_t expectedLinks, uint32_t connectedLinks,
                            uint32_t abnormalLinks) noexcept
 {
-    const uint64_t expectedLinks = (activeRanks == 0) ? 0 : static_cast<uint64_t>(activeRanks) * (activeRanks - 1U);
     const double completionRate = (expectedLinks == 0) ? 1.0 : static_cast<double>(connectedLinks) / expectedLinks;
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(3) << completionRate;
@@ -2082,15 +2109,26 @@ void AppendHeartbeatJson(std::string &out, const std::vector<std::pair<uint32_t,
     out.push_back(']');
 }
 
-// ranks 数组输出：单次遍历同时统计 activeRanks 与序列化非 IDLE rank（IDLE 属预期状态不输出）
-uint32_t AppendGmRanksJson(std::string &out, const std::vector<RankState> &states) noexcept
+// ranks 数组输出：单次遍历同时统计 ACTIVE rank 数、其中 Proxy（无内存）数（供期望链路数计算），
+// 并序列化非 IDLE rank（IDLE 属预期状态不输出），同时带上角色，便于现场直接解释
+// “为什么这两条链路没有”：role=proxy 之间的链路被剪枝。
+struct GmRankCounts {
+    uint32_t activeRanks{0};
+    uint32_t activeProxyRanks{0};
+};
+
+GmRankCounts AppendGmRanksJson(std::string &out, const AccStoreServer::ClusterStatusSnapshot &snap) noexcept
 {
+    const auto &states = snap.states;
+    const bool hasRoles = snap.roles.size() >= snap.maxRanks;
+    GmRankCounts counts;
     out.append(",\"ranks\":[");
-    uint32_t activeRanks = 0;
     std::string sep = "";
     for (uint32_t rankId = 0; rankId < states.size(); ++rankId) {
+        const bool isProxy = hasRoles && (snap.roles[rankId] == SMEM_GROUP_RANK_ROLE_PROXY);
         if (states[rankId] == RANK_ACTIVE) {
-            ++activeRanks;
+            ++counts.activeRanks;
+            counts.activeProxyRanks += isProxy ? 1U : 0U;
         }
         if (states[rankId] == RANK_IDLE) {
             continue;
@@ -2100,11 +2138,15 @@ uint32_t AppendGmRanksJson(std::string &out, const std::vector<RankState> &state
             .append(std::to_string(rankId))
             .append(",\"state\":\"")
             .append(RankStateName(states[rankId]))
-            .append("\"}");
+            .append("\"");
+        if (hasRoles) {
+            out.append(",\"role\":\"").append(RankRoleName(snap.roles[rankId])).append("\"");
+        }
+        out.append("}");
         sep = ",";
     }
     out.push_back(']');
-    return activeRanks;
+    return counts;
 }
 } // namespace
 
@@ -2130,7 +2172,7 @@ AccStoreServer::ClusterStatusSnapshot AccStoreServer::CaptureClusterStatus() noe
     if (groupManager_ != nullptr) {
         snap.hasGm = true;
         snap.maxRanks = groupManager_->GetMaxRanks();
-        groupManager_->GetSnapshot(snap.states, snap.links, snap.transitions);
+        groupManager_->GetSnapshot(snap.states, snap.links, snap.transitions, snap.roles);
     }
     return snap;
 }
@@ -2157,10 +2199,12 @@ void AccStoreServer::GetClusterStatusJson(std::string &out) noexcept
         return;
     }
     out.append(",\"groupManager\":{\"maxRanks\":").append(std::to_string(snap.maxRanks));
-    const uint32_t activeRanks = AppendGmRanksJson(out, snap.states);
+    const GmRankCounts rankCounts = AppendGmRanksJson(out, snap);
     // 单次遍历矩阵产出摘要计数与异常明细，替代原 activeLinks 全量矩阵输出
     LinkSummary summary = CollectLinkSummary(snap, std::chrono::steady_clock::now());
-    AppendLinkSummaryJson(out, activeRanks, summary.connectedLinks, summary.abnormalLinks);
+    AppendLinkSummaryJson(out, rankCounts.activeRanks,
+                          ExpectedLinks(rankCounts.activeRanks, rankCounts.activeProxyRanks), summary.connectedLinks,
+                          summary.abnormalLinks);
     AppendUnstableLinksJson(out, summary.unstableLinks);
     out.append("}}");
 }

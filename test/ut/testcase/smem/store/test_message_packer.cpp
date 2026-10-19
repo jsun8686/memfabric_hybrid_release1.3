@@ -402,6 +402,44 @@ TEST(PackLinkStateResponse, RoundTrip_Empty)
     EXPECT_EQ(result.size(), 0u);
 }
 
+TEST(PackLinkStateResponse, RoundTrip_CarriesRole)
+{
+    /* 角色随 LNKSRSP 回带：非 etcd 模式下 meta 重启后，重连的 rank 靠这条通道
+       让服务端重新拿到角色（重连路径不发 JOINREQ）。 */
+    RankFullInfo rankInfo;
+    rankInfo.rankId = 11;
+    rankInfo.baseInfo = {0xAA};
+    rankInfo.role = SMEM_GROUP_RANK_ROLE_PROXY;
+
+    std::vector<LinkStateEntry> entries;
+    auto msg = SmemMessage::PackLinkStateResponse(rankInfo, entries);
+
+    RankFullInfo resultInfo;
+    std::vector<LinkStateEntry> result;
+    auto ret = SmemMessage::UnpackLinkStateResponse(msg, resultInfo, result);
+    EXPECT_GT(ret, 0);
+    EXPECT_EQ(resultInfo.rankId, 11u);
+    EXPECT_EQ(resultInfo.role, SMEM_GROUP_RANK_ROLE_PROXY);
+}
+
+TEST(PackLinkStateResponse, MissingRoleRejected)
+{
+    /* 角色尾标签是必需字段：同版本对端必带，缺标签只可能是报文被截断，解包必须失败由
+       调用方丢弃，而不是把未知角色当成 provider 继续用。 */
+    RankFullInfo rankInfo;
+    rankInfo.rankId = 9;
+    rankInfo.baseInfo = {0x01};
+
+    std::vector<LinkStateEntry> entries;
+    auto msg = SmemMessage::PackLinkStateResponse(rankInfo, entries);
+    ASSERT_FALSE(msg.values[0].empty());
+    msg.values[0].pop_back(); /* 去掉 role 尾标签，模拟截断报文 */
+
+    RankFullInfo resultInfo;
+    std::vector<LinkStateEntry> result;
+    EXPECT_EQ(SmemMessage::UnpackLinkStateResponse(msg, resultInfo, result), -1);
+}
+
 /* ================================================================== */
 /*  Single ACK                                                         */
 /* ================================================================== */

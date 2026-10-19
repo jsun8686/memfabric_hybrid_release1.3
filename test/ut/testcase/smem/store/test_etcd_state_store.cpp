@@ -175,6 +175,7 @@ TEST_F(EtcdStateStoreTest, DisabledBackendShortCircuitsPersistAndLoad)
     EXPECT_EQ(store_->PersistAliveRanks({0U, 2U}), SUCCESS);
     EXPECT_EQ(store_->PersistRankBase(0U, MakeBytes(1, K_RANK_TWO * K_RANK_TWO)), SUCCESS);
     EXPECT_EQ(store_->PersistRankExternal(0U, {MakeBytes(1, 2)}), SUCCESS);
+    EXPECT_EQ(store_->PersistRankRoles({SMEM_GROUP_RANK_ROLE_PROXY}, K_MAX_RANKS), SUCCESS);
     EXPECT_EQ(store_->DeleteRank(0U), SUCCESS);
     store_->FlushLinks({LINK_CONNECTED}, K_MAX_RANKS);
 
@@ -189,6 +190,9 @@ TEST_F(EtcdStateStoreTest, DisabledBackendShortCircuitsPersistAndLoad)
     EXPECT_EQ(store_->LoadRankBase(0U, base), ERROR);
     std::vector<Bytes> ext;
     EXPECT_EQ(store_->LoadRankExternal(0U, ext), ERROR);
+    std::vector<uint8_t> roles;
+    uint32_t rolesMaxRanks = 0;
+    EXPECT_EQ(store_->LoadRankRoles(roles, rolesMaxRanks), ERROR);
 
     EXPECT_TRUE(backend_->putKeys.empty());
     EXPECT_TRUE(backend_->deletedKeys.empty());
@@ -216,6 +220,25 @@ TEST_F(EtcdStateStoreTest, PersistStatesWritesSerializedData)
     EXPECT_EQ(loaded[0], RANK_CHECKED_IN);
     EXPECT_EQ(loaded[1], RANK_ACTIVE);
     EXPECT_EQ(loaded[K_RANK_TWO], RANK_IDLE);
+}
+
+TEST_F(EtcdStateStoreTest, PersistRankRolesRoundTripSharesSingleKey)
+{
+    /* 角色按单个 blob 持久化（与 states/links 同构）：恢复时只需 1 次 etcd GET，
+     * 恢复耗时与 alive rank 数无关。 */
+    std::vector<uint8_t> roles{SMEM_GROUP_RANK_ROLE_PROVIDER, SMEM_GROUP_RANK_ROLE_PROXY};
+    EXPECT_EQ(store_->PersistRankRoles(roles, K_RANK_TWO), SUCCESS);
+
+    ASSERT_EQ(backend_->putKeys.size(), 1U);
+    EXPECT_EQ(backend_->putKeys[0], "/memfabric_hybrid/group_manager/roles");
+
+    std::vector<uint8_t> loadedRoles;
+    uint32_t loadedMaxRanks = 0;
+    ASSERT_EQ(store_->LoadRankRoles(loadedRoles, loadedMaxRanks), SUCCESS);
+    EXPECT_EQ(loadedMaxRanks, K_RANK_TWO);
+    ASSERT_EQ(loadedRoles.size(), static_cast<size_t>(K_RANK_TWO));
+    EXPECT_EQ(loadedRoles[0], SMEM_GROUP_RANK_ROLE_PROVIDER);
+    EXPECT_EQ(loadedRoles[1], SMEM_GROUP_RANK_ROLE_PROXY);
 }
 
 TEST_F(EtcdStateStoreTest, PersistAliveRanksSortsAndJoins)

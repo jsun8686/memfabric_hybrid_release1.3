@@ -27,6 +27,7 @@ namespace smem {
 namespace {
 
 constexpr uint32_t K_WORLD_SIZE = 4;
+constexpr uint32_t K_RANK_TWO = 2;
 constexpr uint32_t K_STATE_RECOVERED = 2;
 constexpr uint32_t K_STATE_NORMAL = 3;
 constexpr uint32_t K_STATE_EXITED = 4;
@@ -414,6 +415,32 @@ TEST_F(AccStoreServerTest, ClusterStatusUnstableLinksIncludeMiddleState)
     EXPECT_NE(json.find("\"linkSummary\":{\"activeRanks\":2,\"connectedLinks\":0,\"expectedLinks\":2,"
                         "\"completionRate\":0.000,\"abnormalLinks\":0}"),
               std::string::npos);
+}
+
+/* 分离部署观测：ranks 数组带上角色；剪枝对（PROXY<->PROXY）不计入 expectedLinks/abnormal/unstable */
+TEST_F(AccStoreServerTest, ClusterStatusReportsRoleAndExcludesPrunedPairs)
+{
+    auto &gm = *server_->groupManager_.Get();
+    server_->aliveRankSet_ = {0, 1, K_RANK_TWO};
+    gm.states_[0] = RANK_ACTIVE;
+    gm.states_[1] = RANK_ACTIVE;
+    gm.states_[K_RANK_TWO] = RANK_ACTIVE;
+    gm.rankRole_[0] = SMEM_GROUP_RANK_ROLE_PROXY;
+    gm.rankRole_[1] = SMEM_GROUP_RANK_ROLE_PROXY;
+    gm.rankRole_[K_RANK_TWO] = SMEM_GROUP_RANK_ROLE_PROVIDER;
+
+    const std::string json = server_->GetClusterStatusJson();
+    /* 现场直接可见谁是 Proxy */
+    EXPECT_NE(json.find("{\"rank\":0,\"state\":\"RANK_ACTIVE\",\"role\":\"proxy\"}"), std::string::npos);
+    EXPECT_NE(json.find("{\"rank\":1,\"state\":\"RANK_ACTIVE\",\"role\":\"proxy\"}"), std::string::npos);
+    EXPECT_NE(json.find("{\"rank\":2,\"state\":\"RANK_ACTIVE\",\"role\":\"provider\"}"), std::string::npos);
+    /* 3 个 ACTIVE rank 共 6 条有向链路，其中 0<->1 是剪枝对 → expectedLinks=4、abnormalLinks=4（另 4 条 IDLE） */
+    EXPECT_NE(json.find("\"linkSummary\":{\"activeRanks\":3,\"connectedLinks\":0,\"expectedLinks\":4,"
+                        "\"completionRate\":0.000,\"abnormalLinks\":4}"),
+              std::string::npos);
+    /* 剪枝对不进 unstableLinks 明细 */
+    EXPECT_EQ(json.find("\"src\":0,\"dst\":1"), std::string::npos);
+    EXPECT_EQ(json.find("\"src\":1,\"dst\":0"), std::string::npos);
 }
 
 /* unstableLinks 用例②：IDLE 且双端存活 = 断链，双向收录且 elapsedMs=-1 */

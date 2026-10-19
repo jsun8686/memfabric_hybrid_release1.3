@@ -1063,3 +1063,13 @@ TEST_F(SmemBmEntryTest, OnEstablishConnection_DoesNotImportSlicesAgain)
 
     EXPECT_EQ(entry_->OnEstablishConnection(peer.rankId, {peer}, 0), SMEM_OK);
 }
+
+TEST_F(SmemBmEntryTest, DeriveRankRole_FromLocalMemory)
+{
+    /* 不申请任何本地内存（DRAM/HBM 均为 0）即为 Proxy：两个 Proxy 之间不建链 */
+    EXPECT_EQ(SmemBmEntry::DeriveRankRole(0, 0), SMEM_GROUP_RANK_ROLE_PROXY);
+    /* 只要申请了任意一种内存（无论 DRAM 还是 HBM）就是 Provider，保持全互联 */
+    EXPECT_EQ(SmemBmEntry::DeriveRankRole(0, 1), SMEM_GROUP_RANK_ROLE_PROVIDER);
+    EXPECT_EQ(SmemBmEntry::DeriveRankRole(1, 0), SMEM_GROUP_RANK_ROLE_PROVIDER);
+    EXPECT_EQ(SmemBmEntry::DeriveRankRole(4096, 8192), SMEM_GROUP_RANK_ROLE_PROVIDER);
+}

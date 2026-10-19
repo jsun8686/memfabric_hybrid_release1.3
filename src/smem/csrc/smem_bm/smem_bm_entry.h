@@ -98,6 +98,17 @@ public:
     uint64_t GetRealDRAMSize() const;
     uint64_t GetRealHBMSize() const;
 
+    /**
+     * @brief 由本 rank 申请的内存推导角色：DRAM/HBM 都不申请即为 Proxy。
+     *
+     * Proxy 不贡献内存，group manager 会让两个 Proxy rank 之间不建链（分离部署链路剪枝），
+     * 其余角色组合保持全互联。
+     */
+    static uint8_t DeriveRankRole(uint64_t localDRAMSize, uint64_t localHBMSize) noexcept
+    {
+        return (localDRAMSize == 0 && localHBMSize == 0) ? SMEM_GROUP_RANK_ROLE_PROXY : SMEM_GROUP_RANK_ROLE_PROVIDER;
+    }
+
 private:
     bool AddrInHostGva(const void *address, uint64_t size);
     bool AddrInDeviceGva(const void *address, uint64_t size);
@@ -144,6 +155,9 @@ private:
     uint64_t realDRAMSize_ = 0;
     uint64_t realHBMSize_ = 0;
     std::map<uint64_t, std::pair<uint64_t, hybm_mem_slice_t>> registedSlice_;
+    // 由本 rank 实际申请的内存推导（Initialize 时确定）：DRAM/HBM 都不申请即为 PROXY 角色，
+    // 该 rank 与其它 PROXY rank 之间不建链（详见 SmemGroupManagerServer 的链路剪枝）。
+    uint8_t rankRole_{SMEM_GROUP_RANK_ROLE_UNKNOWN};
 
     std::shared_ptr<std::promise<void>> joinComplete_;
 };

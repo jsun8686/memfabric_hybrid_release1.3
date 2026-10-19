@@ -136,6 +136,12 @@ int32_t SmemBmEntry::Initialize(const hybm_options &options)
     if (inited_) {
         return SM_OK;
     }
+    // 分离部署：本 rank 不申请任何本地内存（DRAM/HBM 均为 0）即为 Proxy 角色。Proxy 之间不建链，
+    // 该角色必须在 Join 之前确定；此处按本 rank 实际申请的内存推导，无需外部配置。
+    rankRole_ = DeriveRankRole(options.hostVASpace, options.deviceVASpace);
+    SM_LOG_INFO("BM rank role derived from local memory: role="
+                << RankRoleName(rankRole_) << " (localDRAM=" << options.hostVASpace
+                << ", localHBM=" << options.deviceVASpace << "); two proxy ranks never link");
     uint32_t flags = 0;
     hybm_entity_t entity = nullptr;
     hybm_mem_slice_t slice = nullptr;
@@ -270,6 +276,8 @@ Result SmemBmEntry::Join(uint32_t flags)
     }
 
     RankFullInfo info{groupMgr->GetLocalRankId()};
+    // 角色由本 rank 申请的内存推导（见 Initialize）：Proxy 与 Proxy 之间不建链。
+    info.role = rankRole_;
     if (entityInfo_.descLen > 0 && entityInfo_.desc != nullptr) {
         info.baseInfo.insert(info.baseInfo.end(), entityInfo_.desc, entityInfo_.desc + entityInfo_.descLen);
     }

@@ -343,6 +343,7 @@ smem_bm_t smem_bm_create2(uint32_t id, const smem_bm_create_option_t *option);
 | maxHbmSize          | 所有rank贡献给BM对象的最大HBM内存大小                              |
 | localDRAMSize       | 当前rank贡献给BM对象的DRAM内存大小，单位字节，范围为(0, 2TB]        |
 | localHBMSize        | 当前rank贡献给BM对象的HBM内存大小，单位字节，范围为(0, 64GB]        |
+| 说明                | 当前rank的 `localDRAMSize` 与 `localHBMSize` 同时为 0 时，该rank被视为 Proxy（不贡献内存，仅参与读写），否则为 Provider（贡献内存）；两个 Proxy rank 之间不会建立链路，其余角色组合保持全互联。角色未上报时（如与老版本对端混部）记为 unknown，按非 Proxy 处理 |
 | dataOpType          | 数据操作类型，如果tag或tagOpInfo为空，则使用此类型                   |
 | enable56BitsGva     | 当总地址空间超过32TB时启用56位GVA                                   |
 | flags               | 可选标志，默认0                                                     |

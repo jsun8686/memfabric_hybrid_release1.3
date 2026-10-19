@@ -133,6 +133,7 @@ public:
         std::vector<RankState> states;
         std::vector<LinkState> links;
         std::vector<SmemGroupManagerServer::LinkTransition> transitions;
+        std::vector<uint8_t> roles; // SMEM_GROUP_RANK_ROLE_* per rank，统计时剔除 PROXY<->PROXY 剪枝对
     };
 
 private:

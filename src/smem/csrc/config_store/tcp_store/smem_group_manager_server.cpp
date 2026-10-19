@@ -69,6 +69,7 @@ SmemGroupManagerServer::SmemGroupManagerServer(SmemGroupCommandSender sender, co
     transitions_.assign(maxRanks_ * maxRanks_, LinkTransition{});
     rankBase_.resize(maxRanks_);
     rankExternal_.resize(maxRanks_);
+    rankRole_.assign(maxRanks_, SMEM_GROUP_RANK_ROLE_UNKNOWN);
     isActiveLink_.assign(maxRanks_ * maxRanks_, false);
 }
 
@@ -105,7 +106,8 @@ std::vector<uint32_t> SmemGroupManagerServer::GetAliveRanks() const noexcept
  */
 int SmemGroupManagerServer::CheckIn(const RankFullInfo &info, uint64_t reqId) noexcept
 {
-    STORE_LOG_INFO("[GM][Server][Recv] RCV rank=" << info.rankId << " type=JOINREQ reqId=" << reqId);
+    STORE_LOG_INFO("[GM][Server][Recv] RCV rank=" << info.rankId << " type=JOINREQ reqId=" << reqId
+                                                  << ", role=" << RankRoleName(info.role));
     TP_TRACE_BEGIN(TP_SMEM_GROUP_SERVER_CHECKIN);
     if (info.rankId >= maxRanks_) {
         STORE_LOG_ERROR("CheckIn failed, invalid rankId=" << info.rankId << ", maxRanks=" << maxRanks_
@@ -142,12 +144,18 @@ int SmemGroupManagerServer::CheckIn(const RankFullInfo &info, uint64_t reqId) no
 
         rankBase_[info.rankId] = info.baseInfo;
         rankExternal_[info.rankId] = info.externalInfo;
+        // 角色必须先于建链循环写入：IsLinkPruned 会同时读本 rank 与对端 rank 的角色。
+        rankRole_[info.rankId] = info.role;
 
         states_[info.rankId] = RANK_CHECKED_IN;
         aliveRanks_.insert(info.rankId);
 
         for (uint32_t i = 0; i < maxRanks_; ++i) {
             if ((states_[i] == RANK_ACTIVE || states_[i] == RANK_CHECKED_IN) && i != info.rankId) {
+                // 分离部署剪枝：两个 PROXY 之间不建链，双向保持 LINK_IDLE。
+                if (IsLinkPruned(info.rankId, i)) {
+                    continue;
+                }
                 uint32_t fwdIdx = LinkIndex(info.rankId, i);
                 uint32_t revIdx = LinkIndex(i, info.rankId);
                 links_[fwdIdx] = LINK_EXCHANGING;
@@ -244,6 +252,7 @@ void SmemGroupManagerServer::ResetRankState(uint32_t rankId, std::vector<uint32_
     states_[rankId] = RANK_IDLE;
     rankBase_[rankId].clear();
     rankExternal_[rankId].clear();
+    rankRole_[rankId] = SMEM_GROUP_RANK_ROLE_UNKNOWN;
 
     for (uint32_t i = 0; i < maxRanks_; ++i) {
         if (i == rankId) {
@@ -302,6 +311,14 @@ uint32_t SmemGroupManagerServer::LinkIndex(uint32_t src, uint32_t dst) const noe
     return src * maxRanks_ + dst;
 }
 
+bool SmemGroupManagerServer::IsLinkPruned(uint32_t a, uint32_t b) const noexcept
+{
+    if (a >= maxRanks_ || b >= maxRanks_) {
+        return false;
+    }
+    return rankRole_[a] == SMEM_GROUP_RANK_ROLE_PROXY && rankRole_[b] == SMEM_GROUP_RANK_ROLE_PROXY;
+}
+
 void SmemGroupManagerServer::QueryLinkStates() noexcept
 {
     std::vector<uint32_t> alive;
@@ -333,7 +350,8 @@ void SmemGroupManagerServer::OnLinkStateResponse(const RankFullInfo &rankInfo,
                                                  const std::vector<LinkStateEntry> &entries, uint64_t reqId) noexcept
 {
     const uint32_t rankId = rankInfo.rankId;
-    STORE_LOG_INFO("[GM][Server][Recv] RCV rank=" << rankId << " type=LNKSRSP reqId=" << reqId);
+    STORE_LOG_INFO("[GM][Server][Recv] RCV rank=" << rankId << " type=LNKSRSP reqId=" << reqId
+                                                  << ", role=" << RankRoleName(rankInfo.role));
     if (rankId >= maxRanks_) {
         return;
     }
@@ -341,9 +359,31 @@ void SmemGroupManagerServer::OnLinkStateResponse(const RankFullInfo &rankInfo,
     std::unique_lock<std::mutex> lock(mutex_);
     rankBase_[rankId] = rankInfo.baseInfo;
     rankExternal_[rankId] = rankInfo.externalInfo;
+    // 重连路径（rec:1）不发 JOINREQ，非 etcd 模式又没有角色持久化载体：这里与
+    // base/external 并列，靠对端上报把 rankRole_ 回填，让剪枝判定随重连自愈；
+    // etcd 模式下则作为持久化结果的校验/兜底。必须早于下面的剪枝判定。
+    const uint8_t previousRole = rankRole_[rankId];
+    rankRole_[rankId] = rankInfo.role;
+    // 角色被覆盖是排查剪枝失效的关键节点：PROXY 被改写成非 PROXY 会让该 rank 的剪枝静默
+    // 失效，必须 WARN 留痕；其余角色的覆盖只记 INFO。
+    if (previousRole != rankInfo.role) {
+        if (previousRole == SMEM_GROUP_RANK_ROLE_PROXY && rankInfo.role != SMEM_GROUP_RANK_ROLE_PROXY) {
+            STORE_LOG_WARN("[GM][Server] rank role downgraded from proxy to "
+                           << RankRoleName(rankInfo.role) << " by LNKSRSP. rank=" << rankId
+                           << ", pruning for this rank is now disabled");
+        } else {
+            STORE_LOG_INFO("[GM][Server] rank role overwritten by LNKSRSP. rank=" << rankId << ", role="
+                                                                                  << RankRoleName(rankInfo.role));
+        }
+    }
     aliveRanks_.insert(rankId);
     for (const auto &entry : entries) {
         if (entry.dstRankId >= maxRanks_ || aliveRanks_.find(entry.dstRankId) == aliveRanks_.end()) {
+            continue;
+        }
+        // 剪枝对：忽略对端上报的链路状态，强制保持 IDLE，避免它进入重试/降级扫描。
+        if (IsLinkPruned(rankId, entry.dstRankId)) {
+            links_[LinkIndex(rankId, entry.dstRankId)] = LINK_IDLE;
             continue;
         }
         auto idx = LinkIndex(rankId, entry.dstRankId);
@@ -451,6 +491,10 @@ void SmemGroupManagerServer::PromoteCheckedInRanks(std::vector<uint32_t> &promot
             if (j == r) {
                 continue;
             }
+            // 剪枝对（PROXY<->PROXY）不参与稳定性判定：它永远不会被建链。
+            if (IsLinkPruned(r, j)) {
+                continue;
+            }
             LinkState ls = links_[LinkIndex(r, j)];
             if (ls != LINK_IDLE && ls != LINK_CONNECTED) {
                 allStable = false;
@@ -475,6 +519,10 @@ bool SmemGroupManagerServer::HasEnoughConnectedLinks(uint32_t r) noexcept
             continue;
         }
         if (states_[j] != RANK_ACTIVE && states_[j] != RANK_CHECKED_IN) {
+            continue;
+        }
+        // 剪枝对不计入期望链路数，否则 PROXY rank 会因为没有 PROXY<->PROXY 链路而永远无法 promote。
+        if (IsLinkPruned(r, j)) {
             continue;
         }
         peers++;
@@ -507,6 +555,10 @@ void SmemGroupManagerServer::RetryIdleLinks() noexcept
                 continue;
             }
             if (states_[j] != RANK_ACTIVE && states_[j] != RANK_CHECKED_IN) {
+                continue;
+            }
+            // 剪枝对（PROXY<->PROXY）必须保持 IDLE：否则 30s 一次的断链重试会把剪掉的链路重新拉起。
+            if (IsLinkPruned(r, j)) {
                 continue;
             }
             uint32_t idx = LinkIndex(r, j);
@@ -1109,12 +1161,52 @@ void SmemGroupManagerServer::SetRankExternal(uint32_t rankId, const std::vector<
     rankExternal_[rankId] = data;
 }
 
+void SmemGroupManagerServer::SetRankRole(uint32_t rankId, uint8_t role) noexcept
+{
+    if (rankId >= maxRanks_) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    rankRole_[rankId] = role;
+}
+
+uint8_t SmemGroupManagerServer::GetRankRole(uint32_t rankId) const noexcept
+{
+    if (rankId >= maxRanks_) {
+        return SMEM_GROUP_RANK_ROLE_UNKNOWN;
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    return rankRole_[rankId];
+}
+
+void SmemGroupManagerServer::SetRankRoles(const std::vector<uint8_t> &roles) noexcept
+{
+    std::unique_lock<std::mutex> lock(mutex_);
+    uint32_t n = std::min(static_cast<uint32_t>(roles.size()), maxRanks_);
+    for (uint32_t i = 0; i < n; ++i) {
+        rankRole_[i] = roles[i];
+    }
+    // 不在此处打日志：恢复路径由 EtcdStateStore 汇总输出（含 Proxy 列表），避免重复且不利于定位的日志。
+}
+
+std::vector<uint8_t> SmemGroupManagerServer::GetRoles() const noexcept
+{
+    std::unique_lock<std::mutex> lock(mutex_);
+    return rankRole_;
+}
+
 void SmemGroupManagerServer::RebuildActiveLinks() noexcept
 {
     std::unique_lock<std::mutex> lock(mutex_);
     isActiveLink_.assign(maxRanks_ * maxRanks_, false);
     activeLinks_.clear();
     for (uint32_t i = 0; i < maxRanks_ * maxRanks_; ++i) {
+        // 剪枝对保持 IDLE（稳定态），不进活跃扫描表。
+        if (IsLinkPruned(i / maxRanks_, i % maxRanks_)) {
+            links_[i] = LINK_IDLE;
+            transitions_[i] = {};
+            continue;
+        }
         if (!IsStableLinkState(links_[i])) {
             isActiveLink_[i] = true;
             activeLinks_.push_back(i);

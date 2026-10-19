@@ -29,6 +29,31 @@ using Bytes = std::vector<uint8_t>;
 constexpr uint8_t SMEM_RANK_PROTOCOL_DEFAULT = 0; // BM / unspecified
 constexpr uint8_t SMEM_RANK_PROTOCOL_TRANS = 1;   // TRANS
 
+// RankFullInfo::role values — 角色由本 rank 申请的内存推导（DRAM/HBM 都为 0 ⇒ PROXY）。
+// A PROXY rank contributes no memory; two PROXY ranks are never linked, so the
+// group manager skips their whitelist/establish exchange entirely. Every other
+// role combination stays fully connected.
+constexpr uint8_t SMEM_GROUP_RANK_ROLE_PROVIDER = 0; // contributes memory
+constexpr uint8_t SMEM_GROUP_RANK_ROLE_PROXY = 1;    // no memory, proxy only
+// 角色未知：本 rank 未声明角色（老版本对端不带 role 标签）、rank 已复位或查询越界。
+// 未知一律按“非 PROXY”处理，因此不触发剪枝，链路行为与 PROVIDER 相同；但日志与集群状态
+// 会如实显示 unknown，避免把“不知道”报成“贡献内存”。
+constexpr uint8_t SMEM_GROUP_RANK_ROLE_UNKNOWN = 2;
+
+// 日志用角色名：客户端上报与服务端落库两侧共用，保证排查角色问题的日志口径一致。
+inline const char *RankRoleName(uint8_t role) noexcept
+{
+    switch (role) {
+        case SMEM_GROUP_RANK_ROLE_PROXY:
+            return "proxy";
+        case SMEM_GROUP_RANK_ROLE_PROVIDER:
+            return "provider";
+        case SMEM_GROUP_RANK_ROLE_UNKNOWN:
+        default:
+            return "unknown";
+    }
+}
+
 // 可重试的瞬时状态标记：P2P 尚未使能（对应 hybm 的 BM_P2P_NOT_READY）。经 OnAddToWhitelist
 // 上抛给 GM 客户端 dispatcher，用于仅跳过该情形的失败 ERROR 打印（根因已在 segment 层记 WARN）。
 constexpr int32_t SMEM_GROUP_P2P_NOT_READY = -406;
@@ -48,6 +73,9 @@ struct RankFullInfo : RankBaseInfo {
     // Carried in the JOINREQ body so the server can tell a Trans re-join
     // (which always sends a fresh JOINREQ) apart from a stale/duplicate one.
     uint8_t protocol{0};
+    // Rank role (SMEM_GROUP_RANK_ROLE_*). Carried in the JOINREQ body so the
+    // server can prune PROXY<->PROXY links; absent in older peers → unknown.
+    uint8_t role{SMEM_GROUP_RANK_ROLE_UNKNOWN};
     explicit RankFullInfo(const uint32_t id = 0) noexcept : RankBaseInfo{id} {}
 };
 

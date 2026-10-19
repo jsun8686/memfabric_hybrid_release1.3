@@ -76,6 +76,37 @@ StoreErrorCode EtcdStateStore::DeserializeStates(const std::vector<uint8_t> &dat
     return StoreErrorCode::SUCCESS;
 }
 
+StoreErrorCode EtcdStateStore::SerializeRoles(const std::vector<uint8_t> &roles, uint32_t maxRanks,
+                                              std::vector<uint8_t> &out) noexcept
+{
+    uint32_t n = std::min(static_cast<uint32_t>(roles.size()), maxRanks);
+    out.resize(sizeof(uint32_t) + n);
+    auto *ptr = out.data();
+    std::copy_n(static_cast<const uint8_t *>(static_cast<const void *>(&maxRanks)), sizeof(uint32_t), ptr);
+    ptr += sizeof(uint32_t);
+    for (uint32_t i = 0; i < n; ++i) {
+        ptr[i] = roles[i];
+    }
+    return StoreErrorCode::SUCCESS;
+}
+
+StoreErrorCode EtcdStateStore::DeserializeRoles(const std::vector<uint8_t> &data, std::vector<uint8_t> &roles,
+                                                uint32_t &maxRanks) noexcept
+{
+    if (data.size() < sizeof(uint32_t)) {
+        return StoreErrorCode::ERROR;
+    }
+    std::copy_n(data.data(), sizeof(uint32_t), static_cast<uint8_t *>(static_cast<void *>(&maxRanks)));
+    if (data.size() < sizeof(uint32_t) + maxRanks) {
+        return StoreErrorCode::ERROR;
+    }
+    roles.resize(maxRanks);
+    for (uint32_t i = 0; i < maxRanks; ++i) {
+        roles[i] = data[sizeof(uint32_t) + i];
+    }
+    return StoreErrorCode::SUCCESS;
+}
+
 StoreErrorCode EtcdStateStore::SerializeLinks(const std::vector<LinkState> &links, uint32_t maxRanks,
                                               std::vector<uint8_t> &out) noexcept
 {
@@ -195,6 +226,19 @@ StoreErrorCode EtcdStateStore::PersistRankExternal(uint32_t rankId, const std::v
         buf.insert(buf.end(), item.begin(), item.end());
     }
     return PutWithRetry(backend_, RankExtKey(rankId), buf, 0);
+}
+
+StoreErrorCode EtcdStateStore::PersistRankRoles(const std::vector<uint8_t> &roles, uint32_t maxRanks) noexcept
+{
+    if (!IsEnabled()) {
+        return StoreErrorCode::SUCCESS;
+    }
+    std::vector<uint8_t> data;
+    auto ret = SerializeRoles(roles, maxRanks, data);
+    if (ret != StoreErrorCode::SUCCESS) {
+        return ret;
+    }
+    return PutWithRetry(backend_, keyRoles, data, 0);
 }
 
 StoreErrorCode EtcdStateStore::DeleteRank(uint32_t rankId) noexcept
@@ -317,6 +361,19 @@ StoreErrorCode EtcdStateStore::LoadRankBase(uint32_t rankId, Bytes &data) noexce
     return backend_->Get(RankBaseKey(rankId), data);
 }
 
+StoreErrorCode EtcdStateStore::LoadRankRoles(std::vector<uint8_t> &roles, uint32_t &maxRanks) noexcept
+{
+    if (!IsEnabled()) {
+        return StoreErrorCode::ERROR;
+    }
+    std::vector<uint8_t> data;
+    auto ret = backend_->Get(keyRoles, data);
+    if (ret != StoreErrorCode::SUCCESS) {
+        return ret;
+    }
+    return DeserializeRoles(data, roles, maxRanks);
+}
+
 StoreErrorCode EtcdStateStore::LoadRankExternal(uint32_t rankId, std::vector<Bytes> &data) noexcept
 {
     if (!IsEnabled()) {
@@ -351,6 +408,33 @@ StoreErrorCode EtcdStateStore::LoadRankExternal(uint32_t rankId, std::vector<Byt
 }
 
 // ── 完整恢复流程 ──
+
+// 观测：一次性汇总恢复出的 Proxy rank 列表，供定位“为什么这些链路没建”，并与 rank 自身
+// （BM Initialize 的 role 推导日志）互为交叉校验。列表长度设上限，避免大规模集群刷超长日志。
+void LogRestoredRankRoles(const std::vector<uint8_t> &roles, size_t aliveCount) noexcept
+{
+    constexpr size_t kMaxLoggedProxies = 32U;
+    std::string proxyRanks;
+    size_t proxyCount = 0;
+    for (size_t i = 0; i < roles.size(); ++i) {
+        if (roles[i] != SMEM_GROUP_RANK_ROLE_PROXY) {
+            continue;
+        }
+        ++proxyCount;
+        if (proxyCount > kMaxLoggedProxies) {
+            continue;
+        }
+        if (!proxyRanks.empty()) {
+            proxyRanks.push_back(',');
+        }
+        proxyRanks += std::to_string(i);
+    }
+    if (proxyCount > kMaxLoggedProxies) {
+        proxyRanks += ",...";
+    }
+    STORE_LOG_INFO("EtcdStateStore: rank roles restored, alive=" << aliveCount << ", proxyCount=" << proxyCount
+                                                                 << ", proxyRanks=[" << proxyRanks << "]");
+}
 
 StoreErrorCode EtcdStateStore::Recover(SmemGroupManagerServer *server) noexcept
 {
@@ -393,10 +477,21 @@ StoreErrorCode EtcdStateStore::Recover(SmemGroupManagerServer *server) noexcept
         }
     }
 
-    // 4. 重建 activeLinks_
+    // 4. 恢复角色：与 states/links 一样整体只读一次，恢复耗时与 alive rank 数无关；
+    //    必须在 RebuildActiveLinks/QueryLinkStates 之前完成，否则 PROXY<->PROXY 剪枝对会被重新拉起。
+    std::vector<uint8_t> roles;
+    uint32_t rolesMaxRanks = 0;
+    if (LoadRankRoles(roles, rolesMaxRanks) == StoreErrorCode::SUCCESS && rolesMaxRanks == maxRanks) {
+        server->SetRankRoles(roles);
+        LogRestoredRankRoles(roles, aliveSet.size());
+    } else {
+        STORE_LOG_INFO("EtcdStateStore: rank roles missing or stale, all ranks treated as unknown");
+    }
+
+    // 5. 重建 activeLinks_
     server->RebuildActiveLinks();
 
-    // 5. 查询所有存活 rank 的实际状态
+    // 6. 查询所有存活 rank 的实际状态
     server->QueryLinkStates();
 
     STORE_LOG_INFO("EtcdStateStore: recovery complete, ranks=" << aliveSet.size());

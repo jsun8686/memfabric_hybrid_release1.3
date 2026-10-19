@@ -1162,8 +1162,8 @@ Result TcpConfigStore::HandleQueryLinkState(SmemMessage &msg) noexcept
     }
     SmemMessage response = SmemMessage::PackLinkStateResponse(localRankInfo_, entries);
     auto packedResponse = SmemMessagePacker::Pack(response);
-    STORE_LOG_INFO("[GM][Client][Send] rank=" << localRankId_ << " type=LNKSRSP reqId=" << msg.requestId
-                                              << " entries=" << entries.size());
+    STORE_LOG_INFO("[GM][Client][Send] rank=" << localRankId_ << " type=LNKSRSP reqId=" << msg.requestId << " entries="
+                                              << entries.size() << ", role=" << RankRoleName(localRankInfo_.role));
     auto sendRet = SendMessageNonBlock(packedResponse);
     STORE_LOG_INFO("[GM][Client][Send] rank=" << localRankId_ << " type=LNKSRSP return=" << sendRet);
     if (sendRet != SM_OK) {

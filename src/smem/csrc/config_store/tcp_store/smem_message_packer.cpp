@@ -374,6 +374,7 @@ SmemMessage SmemMessage::PackJoin(const RankFullInfo &info) noexcept
         buf.insert(buf.end(), ext.begin(), ext.end());
     }
     buf.push_back(info.protocol);
+    buf.push_back(info.role);
     msg.values.emplace_back(std::move(buf));
     return msg;
 }
@@ -403,11 +404,15 @@ int64_t SmemMessage::UnpackJoin(const SmemMessage &msg, RankFullInfo &info) noex
         }
     }
     // Protocol tag is an extension appended after the fixed fields; older peers
-    // omit it, in which case it defaults to 0 (BM/default).
+    // omit it, in which case it defaults to 0 (BM/default). The rank role tag
+    // follows the protocol tag and defaults to UNKNOWN when absent.
+    info.protocol = SMEM_RANK_PROTOCOL_DEFAULT;
+    info.role = SMEM_GROUP_RANK_ROLE_UNKNOWN;
     if (offset < buf.size()) {
-        info.protocol = buf[offset];
-    } else {
-        info.protocol = 0;
+        info.protocol = buf[offset++];
+    }
+    if (offset < buf.size()) {
+        info.role = buf[offset++];
     }
     return static_cast<int64_t>(offset);
 }
@@ -480,6 +485,9 @@ SmemMessage SmemMessage::PackLinkStateResponse(const RankFullInfo &rankInfo,
         AppendUint64(infoBuf, ext.size());
         infoBuf.insert(infoBuf.end(), ext.begin(), ext.end());
     }
+    // Role tag is mandatory: it always follows the fixed fields, and the unpacking side treats a
+    // missing tag as a truncated payload.
+    infoBuf.push_back(rankInfo.role);
     msg.values.emplace_back(std::move(infoBuf));
     std::vector<uint8_t> buf;
     uint64_t count = entries.size();
@@ -520,6 +528,12 @@ int64_t SmemMessage::UnpackLinkStateResponse(const SmemMessage &msg, RankFullInf
             return -1;
         }
     }
+    // Role tag always follows the fixed fields; a truncated payload must not silently degrade the
+    // rank role, so treat it as a malformed message.
+    if (offset >= infoBuf.size()) {
+        return -1;
+    }
+    rankInfo.role = infoBuf[offset++];
     const auto &buf = msg.values[1];
     uint64_t entryOffset = 0;
     uint64_t count = 0;
