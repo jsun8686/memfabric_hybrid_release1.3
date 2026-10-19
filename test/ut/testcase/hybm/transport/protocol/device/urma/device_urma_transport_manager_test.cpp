@@ -1552,7 +1552,7 @@ TEST(DeviceUrmaTransportManagerTest, PrepareCreatesThreadChannelAndImportsMemKey
     EXPECT_EQ(state.imports.front().addr, MOCK_REMOTE_ADDR);
 }
 
-TEST(DeviceUrmaTransportManagerTest, PrepareCreatesAllChannelsBeforeWaitingForReady)
+TEST(DeviceUrmaTransportManagerTest, PrepareCreatesAllChannelsAndConnectRankWaitsAfterwards)
 {
     constexpr uint32_t kPeerCount = 3U;
     DlHcommApiFnGuard guard;
@@ -1579,14 +1579,19 @@ TEST(DeviceUrmaTransportManagerTest, PrepareCreatesAllChannelsBeforeWaitingForRe
 
     g_prepareEvents.clear();
     ASSERT_EQ(manager.Prepare(options), BM_OK);
-    ASSERT_EQ(g_prepareEvents.size(), kPeerCount * 2U);
+    ASSERT_EQ(g_prepareEvents.size(), kPeerCount);
+    EXPECT_TRUE(std::all_of(g_prepareEvents.begin(), g_prepareEvents.end(),
+                            [](PrepareEvent event) { return event == PrepareEvent::CHANNEL_CREATE; }));
+    g_prepareEvents.clear();
+    ASSERT_EQ(manager.ConnectRank(1U), BM_OK);
+    ASSERT_EQ(g_prepareEvents.size(), kPeerCount);
     for (size_t i = 0U; i < kPeerCount; ++i) {
-        EXPECT_EQ(g_prepareEvents[i], PrepareEvent::CHANNEL_CREATE);
-        EXPECT_EQ(g_prepareEvents[i + kPeerCount], PrepareEvent::CHANNEL_STATUS);
+        EXPECT_EQ(g_prepareEvents[i], PrepareEvent::CHANNEL_STATUS);
     }
+    EXPECT_EQ(manager.RemoveRanks({1U, 2U, 3U}), BM_OK);
 }
 
-TEST(DeviceUrmaTransportManagerTest, PrepareWaitFailureRollsBackRemainingPendingChannels)
+TEST(DeviceUrmaTransportManagerTest, ConnectRankWaitFailureKeepsPreparedChannels)
 {
     constexpr uint32_t kPeerCount = 3U;
     DlHcommApiFnGuard guard;
@@ -1613,10 +1618,16 @@ TEST(DeviceUrmaTransportManagerTest, PrepareWaitFailureRollsBackRemainingPending
 
     g_channelDestroyCallCount = 0;
     g_threadFreeCallCount = 0;
-    EXPECT_EQ(manager.Prepare(options), BM_NOT_CONNECTED);
+    ASSERT_EQ(manager.Prepare(options), BM_OK);
+    EXPECT_EQ(g_channelDestroyCallCount, 0);
+    EXPECT_EQ(g_threadFreeCallCount, 0);
+    EXPECT_EQ(manager.ConnectRank(1U), BM_NOT_CONNECTED);
+    EXPECT_EQ(g_channelDestroyCallCount, 0);
+    EXPECT_EQ(g_threadFreeCallCount, 0);
+    EXPECT_EQ(manager.remoteRanks_.size(), kPeerCount);
+    EXPECT_EQ(manager.RemoveRanks({1U, 2U, 3U}), BM_OK);
     EXPECT_EQ(g_channelDestroyCallCount, kPeerCount);
     EXPECT_EQ(g_threadFreeCallCount, kPeerCount);
-    EXPECT_TRUE(manager.remoteRanks_.empty());
 }
 
 TEST(DeviceUrmaTransportManagerTest, PrepareUsesConfiguredUbQos)
@@ -2124,7 +2135,7 @@ TEST(DeviceUrmaTransportManagerTest, PrepareFailsWhenCreatingThreadOrChannel)
     EXPECT_EQ(manager.remoteRanks_[1].thread, 0U);
 }
 
-TEST(DeviceUrmaTransportManagerTest, PreparePollsInProgressUntilReady)
+TEST(DeviceUrmaTransportManagerTest, ConnectRankPollsInProgressUntilReady)
 {
     DlHcommApiFnGuard guard;
     DlHcommApi::gHcommEndpointCreate = MockHcommEndpointCreate;
@@ -2150,14 +2161,28 @@ TEST(DeviceUrmaTransportManagerTest, PreparePollsInProgressUntilReady)
     info.role = HYBM_ROLE_PEER;
     options.options.emplace(1, std::move(info));
 
-    // 无 memKeys，验证轮询行为（两次 IN_PROGRESS 后 READY），不涉及 mem import
+    // 无 memKeys，验证 Prepare 不轮询，ConnectRank 两次 IN_PROGRESS 后才完成。
     EXPECT_EQ(manager.Prepare(options), BM_OK);
+    EXPECT_EQ(g_getStatusCallCount, 0UL);
+    EXPECT_EQ(manager.ConnectRank(1U), BM_OK);
     EXPECT_EQ(g_getStatusCallCount, 3UL); // 两次 IN_PROGRESS + 一次 READY
     EXPECT_EQ(manager.remoteRanks_[1].channel, MOCK_CHANNEL);
     EXPECT_EQ(manager.remoteRanks_[1].thread, MOCK_THREAD);
+    EXPECT_EQ(manager.RemoveRanks({1U}), BM_OK);
 }
 
-TEST(DeviceUrmaTransportManagerTest, PrepareGetStatusApiFailureDestroysChannelAndThread)
+TEST(DeviceUrmaTransportManagerTest, ConnectRankValidatesStateAndAllowsNoPeers)
+{
+    DeviceUrmaTransportManager manager;
+    manager.rankCount_ = 2U;
+    EXPECT_EQ(manager.ConnectRank(0U), BM_ERROR);
+
+    manager.opened_ = true;
+    EXPECT_EQ(manager.ConnectRank(2U), BM_INVALID_PARAM);
+    EXPECT_EQ(manager.ConnectRank(1U), BM_OK);
+}
+
+TEST(DeviceUrmaTransportManagerTest, ConnectRankGetStatusApiFailureKeepsChannelAndThread)
 {
     DlHcommApiFnGuard guard;
     DlHcommApi::gHcommEndpointCreate = MockHcommEndpointCreate;
@@ -2184,14 +2209,16 @@ TEST(DeviceUrmaTransportManagerTest, PrepareGetStatusApiFailureDestroysChannelAn
     info.role = HYBM_ROLE_PEER;
     options.options.emplace(1, std::move(info));
 
-    EXPECT_EQ(manager.Prepare(options), BM_DL_FUNCTION_FAILED);
-    EXPECT_EQ(g_channelDestroyCallCount, 1);
-    EXPECT_EQ(g_threadFreeCallCount, 1);
-    EXPECT_EQ(manager.remoteRanks_[1].channel, 0U);
-    EXPECT_EQ(manager.remoteRanks_[1].thread, 0U);
+    ASSERT_EQ(manager.Prepare(options), BM_OK);
+    EXPECT_EQ(manager.ConnectRank(1U), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(g_channelDestroyCallCount, 0);
+    EXPECT_EQ(g_threadFreeCallCount, 0);
+    EXPECT_EQ(manager.remoteRanks_[1].channel, MOCK_CHANNEL);
+    EXPECT_EQ(manager.remoteRanks_[1].thread, MOCK_THREAD);
+    EXPECT_EQ(manager.RemoveRanks({1U}), BM_OK);
 }
 
-TEST(DeviceUrmaTransportManagerTest, PrepareGetStatusFailedDestroysChannelAndThread)
+TEST(DeviceUrmaTransportManagerTest, ConnectRankGetStatusFailedKeepsChannelAndThread)
 {
     DlHcommApiFnGuard guard;
     DlHcommApi::gHcommEndpointCreate = MockHcommEndpointCreate;
@@ -2218,14 +2245,16 @@ TEST(DeviceUrmaTransportManagerTest, PrepareGetStatusFailedDestroysChannelAndThr
     info.role = HYBM_ROLE_PEER;
     options.options.emplace(1, std::move(info));
 
-    EXPECT_EQ(manager.Prepare(options), BM_NOT_CONNECTED);
-    EXPECT_EQ(g_channelDestroyCallCount, 1);
-    EXPECT_EQ(g_threadFreeCallCount, 1);
-    EXPECT_EQ(manager.remoteRanks_[1].channel, 0U);
-    EXPECT_EQ(manager.remoteRanks_[1].thread, 0U);
+    ASSERT_EQ(manager.Prepare(options), BM_OK);
+    EXPECT_EQ(manager.ConnectRank(1U), BM_NOT_CONNECTED);
+    EXPECT_EQ(g_channelDestroyCallCount, 0);
+    EXPECT_EQ(g_threadFreeCallCount, 0);
+    EXPECT_EQ(manager.remoteRanks_[1].channel, MOCK_CHANNEL);
+    EXPECT_EQ(manager.remoteRanks_[1].thread, MOCK_THREAD);
+    EXPECT_EQ(manager.RemoveRanks({1U}), BM_OK);
 }
 
-TEST(DeviceUrmaTransportManagerTest, PrepareGetStatusTimeoutDestroysChannelAndThread)
+TEST(DeviceUrmaTransportManagerTest, ConnectRankGetStatusTimeoutKeepsChannelAndThread)
 {
     DlHcommApiFnGuard guard;
     DlHcommApi::gHcommEndpointCreate = MockHcommEndpointCreate;
@@ -2252,14 +2281,16 @@ TEST(DeviceUrmaTransportManagerTest, PrepareGetStatusTimeoutDestroysChannelAndTh
     info.role = HYBM_ROLE_PEER;
     options.options.emplace(1, std::move(info));
 
-    EXPECT_EQ(manager.Prepare(options), BM_TIMEOUT);
-    EXPECT_EQ(g_channelDestroyCallCount, 1);
-    EXPECT_EQ(g_threadFreeCallCount, 1);
-    EXPECT_EQ(manager.remoteRanks_[1].channel, 0U);
-    EXPECT_EQ(manager.remoteRanks_[1].thread, 0U);
+    ASSERT_EQ(manager.Prepare(options), BM_OK);
+    EXPECT_EQ(manager.ConnectRank(1U), BM_TIMEOUT);
+    EXPECT_EQ(g_channelDestroyCallCount, 0);
+    EXPECT_EQ(g_threadFreeCallCount, 0);
+    EXPECT_EQ(manager.remoteRanks_[1].channel, MOCK_CHANNEL);
+    EXPECT_EQ(manager.remoteRanks_[1].thread, MOCK_THREAD);
+    EXPECT_EQ(manager.RemoveRanks({1U}), BM_OK);
 }
 
-TEST(DeviceUrmaTransportManagerTest, PrepareGetStatusUnknownDestroysChannelAndThread)
+TEST(DeviceUrmaTransportManagerTest, ConnectRankGetStatusUnknownKeepsChannelAndThread)
 {
     DlHcommApiFnGuard guard;
     DlHcommApi::gHcommEndpointCreate = MockHcommEndpointCreate;
@@ -2286,11 +2317,13 @@ TEST(DeviceUrmaTransportManagerTest, PrepareGetStatusUnknownDestroysChannelAndTh
     info.role = HYBM_ROLE_PEER;
     options.options.emplace(1, std::move(info));
 
-    EXPECT_EQ(manager.Prepare(options), BM_DL_FUNCTION_FAILED);
-    EXPECT_EQ(g_channelDestroyCallCount, 1);
-    EXPECT_EQ(g_threadFreeCallCount, 1);
-    EXPECT_EQ(manager.remoteRanks_[1].channel, 0U);
-    EXPECT_EQ(manager.remoteRanks_[1].thread, 0U);
+    ASSERT_EQ(manager.Prepare(options), BM_OK);
+    EXPECT_EQ(manager.ConnectRank(1U), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(g_channelDestroyCallCount, 0);
+    EXPECT_EQ(g_threadFreeCallCount, 0);
+    EXPECT_EQ(manager.remoteRanks_[1].channel, MOCK_CHANNEL);
+    EXPECT_EQ(manager.remoteRanks_[1].thread, MOCK_THREAD);
+    EXPECT_EQ(manager.RemoveRanks({1U}), BM_OK);
 }
 
 TEST(DeviceUrmaTransportManagerTest, UpdateRankOptionsFallsBackForNewRankAndChecksEdges)

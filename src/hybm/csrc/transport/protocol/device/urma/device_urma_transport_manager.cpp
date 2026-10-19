@@ -1771,7 +1771,6 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
 
         // 2. Idempotency: if thread and channel already exist, compare with stored remoteEndpointDesc.
         //    If unchanged → skip resource creation; if changed → reject (no hot-replace).
-        //    Existing resources are already ready, so only new resources enter the wait phase below.
         if (state.channel != 0 && state.thread != 0) {
             if (std::memcmp(&state.remoteEndpointDesc, &peerDesc, sizeof(UrmaEndpointDesc)) != 0) {
                 BM_LOG_ERROR(
@@ -1855,22 +1854,6 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
         }
     }
 
-    std::vector<HcommChannelReadyPeer> channelPeerRanks;
-    channelPeerRanks.reserve(pendingCreatedPeerRanks.size());
-    for (const auto &item : options.options) {
-        const auto peerRank = item.first;
-        if (pendingCreatedPeerRanks.count(peerRank) != 0U) {
-            channelPeerRanks.push_back({remoteRanks_.at(peerRank).channel, peerRank});
-        }
-    }
-    auto ret = HcommApiWrapper::WaitForChannelsReady(channelPeerRanks);
-    if (ret != BM_OK) {
-        BM_LOG_ERROR("device_urma Prepare WaitForChannelsReady failed, localRank: "
-                     << rankId_ << " pendingPeerCount: " << pendingCreatedPeerRanks.size() << " ret: " << ret);
-        RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
-        return ret;
-    }
-
     for (const auto &item : options.options) {
         const auto peerRank = item.first;
         if (peerRank == rankId_) {
@@ -1880,7 +1863,7 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
         const bool resourcesCreatedInThisCall = pendingCreatedPeerRanks.count(peerRank) != 0U;
 
         // 8. Import remote memory keys (always, even if channel/thread were reused)
-        ret = ImportRemoteMemKeysLocked(peerRank, state, options.options.at(peerRank).memKeys);
+        auto ret = ImportRemoteMemKeysLocked(peerRank, state, options.options.at(peerRank).memKeys);
         if (ret != BM_OK) {
             BM_LOG_ERROR("device_urma Prepare ImportRemoteMemKeysLocked failed, peer: " << peerRank);
             RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
@@ -1894,6 +1877,25 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
         }
     }
     return BM_OK;
+}
+
+Result DeviceUrmaTransportManager::ConnectRank(uint32_t rankId)
+{
+    std::shared_lock<std::shared_mutex> guard(mutex_);
+    BM_VALIDATE_RETURN(opened_, "device_urma transport manager is not opened", BM_ERROR);
+    BM_VALIDATE_RETURN(rankId < rankCount_,
+                       "device_urma ConnectRank rank: " << rankId << " out of range, rankCount: " << rankCount_,
+                       BM_INVALID_PARAM);
+
+    std::vector<HcommChannelReadyPeer> channelPeers;
+    channelPeers.reserve(remoteRanks_.size());
+    for (const auto &item : remoteRanks_) {
+        if (item.first != rankId_ && item.second.channel != 0) {
+            channelPeers.push_back({item.second.channel, item.first});
+        }
+    }
+    // Keep channel handles alive until the wrapper finishes polling.
+    return HcommApiWrapper::WaitForChannelsReady(channelPeers);
 }
 
 void DeviceUrmaTransportManager::RollbackPendingPrepareResourcesLocked(const std::set<uint32_t> &peerRanks)

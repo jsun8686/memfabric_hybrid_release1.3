@@ -183,6 +183,8 @@ public:
     // Prepare/rank/connection/private data
     Result Prepare(const HybmTransPrepareOptions &options) override;
 
+    Result ConnectRank(uint32_t rankId) override;
+
     Result RemoveRanks(const std::vector<uint32_t> &removedRanks) override;
 
     Result UpdateRankOptions(const HybmTransPrepareOptions &options) override;
