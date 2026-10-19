@@ -1742,10 +1742,12 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
     BM_VALIDATE_RETURN(!localEndpoint_.empty(),
                        "evice_urma Prepare failed: localEndpoint_ is null (OpenDevice may not have completed)",
                        BM_NOT_INITIALIZED);
+    std::set<uint32_t> pendingCreatedPeerRanks;
     for (const auto &item : options.options) {
         const uint32_t peerRank = item.first;
         if (peerRank >= rankCount_) {
             BM_LOG_ERROR("device_urma Prepare invalid peerRank: " << peerRank << " rankCount: " << rankCount_);
+            RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
             return BM_INVALID_PARAM;
         }
         if (peerRank == rankId_) {
@@ -1763,22 +1765,21 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
         auto ret = ParsePrivateDataToEndpointDesc(item.second.privateData, localId, peerDesc);
         if (ret != BM_OK) {
             BM_LOG_ERROR("device_urma Prepare failed to parse peer endpoint desc, peer: " << peerRank);
+            RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
             return ret;
         }
 
-        bool resourcesCreatedInThisCall = false;
-
         // 2. Idempotency: if thread and channel already exist, compare with stored remoteEndpointDesc.
         //    If unchanged → skip resource creation; if changed → reject (no hot-replace).
-        //    Either way, fall through to mem import — do NOT continue.
+        //    Existing resources are already ready, so only new resources enter the wait phase below.
         if (state.channel != 0 && state.thread != 0) {
             if (std::memcmp(&state.remoteEndpointDesc, &peerDesc, sizeof(UrmaEndpointDesc)) != 0) {
                 BM_LOG_ERROR(
                     "device_urma Prepare peer endpoint desc changed but hot-replace not supported, peer: " << peerRank);
+                RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
                 return BM_INVALID_PARAM;
             }
             BM_LOG_INFO("device_urma Prepare reusing existing channel/thread for peer: " << peerRank);
-            // resourcesCreatedInThisCall remains false — do not destroy channel/thread on import failure
         } else {
             // 3. Convert peer UrmaEndpointDesc → HCOMM EndpointDesc for HcommChannelDesc.remoteEndpoint
             EndpointDesc hcommRemoteEndpoint = ToHcommEndpointDesc(peerDesc);
@@ -1799,10 +1800,12 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
             if (ret != BM_OK) {
                 BM_LOG_ERROR("device_urma Prepare HcommThreadAlloc failed, peer: "
                              << peerRank << " engine: " << COMM_ENGINE_AICPU_TS << " ret: " << ret);
+                RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
                 return ret;
             }
             if (threadHandle == 0) {
                 BM_LOG_ERROR("device_urma Prepare HcommThreadAlloc returned invalid thread, peer: " << peerRank);
+                RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
                 return BM_DL_FUNCTION_FAILED;
             }
 
@@ -1825,6 +1828,7 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
                 auto rollbackThread = threadHandle;
                 // No stream sync needed: thread was just allocated, no RemoteIO launched during Prepare.
                 (void)DlHcommApi::HcommThreadFree(&rollbackThread, 1);
+                RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
                 return BM_DL_FUNCTION_FAILED;
             }
             if (channelHandle == 0) {
@@ -1832,6 +1836,7 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
                 auto rollbackThread = threadHandle;
                 // No stream sync needed: thread was just allocated, no RemoteIO launched during Prepare.
                 (void)DlHcommApi::HcommThreadFree(&rollbackThread, 1);
+                RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
                 return BM_DL_FUNCTION_FAILED;
             }
 
@@ -1841,68 +1846,70 @@ Result DeviceUrmaTransportManager::Prepare(const HybmTransPrepareOptions &option
             state.thread = threadHandle;
             state.channelDesc = channelDesc;
             state.channel = channelHandle;
-            resourcesCreatedInThisCall = true;
+            pendingCreatedPeerRanks.insert(peerRank);
 
             BM_LOG_INFO("device_urma Prepare created channel/thread, peer: "
                         << peerRank << " peerDev=" << peerDesc.devPhyId << " peerServer=" << peerDesc.serverIdx
                         << " peerSuperPod=" << peerDesc.superPodIdx << " localDev=" << phyDeviceId_
                         << " thread: " << threadHandle << " channel: " << channelHandle);
-
-            // 7.5 Wait for channel ready before importing mem keys
-            ret = HcommApiWrapper::WaitForChannelReady(channelHandle, peerRank);
-            if (ret != BM_OK) {
-                // peerRank 是 rankId*64+entryIdx 的合成值，不直观；此处补对端/本端卡定位信息，
-                // 卡号与 serverIdx 来自对端 endpoint desc（对端序列化其真实拓扑），可直接定位到卡
-                BM_LOG_ERROR("device_urma Prepare WaitForChannelReady failed, peer: "
-                             << peerRank << " peerDev=" << peerDesc.devPhyId << " peerServer=" << peerDesc.serverIdx
-                             << " peerSuperPod=" << peerDesc.superPodIdx << " localDev=" << phyDeviceId_
-                             << " localServer=" << serverId_ << " ret: " << ret);
-                auto rbRet = DlHcommApi::HcommChannelDestroy(&channelHandle, 1);
-                if (rbRet != 0) {
-                    BM_LOG_ERROR("device_urma Prepare rollback HcommChannelDestroy failed, "
-                                 << "channel: " << channelHandle << " peer: " << peerRank << " ret: " << rbRet);
-                }
-                auto trRet = DlHcommApi::HcommThreadFree(&threadHandle, 1);
-                if (trRet != 0) {
-                    BM_LOG_ERROR("device_urma Prepare rollback HcommThreadFree failed, "
-                                 << "thread: " << threadHandle << " peer: " << peerRank << " ret: " << trRet);
-                }
-                remoteRanks_.erase(peerRank);
-                return ret;
-            }
         }
+    }
+
+    std::vector<HcommChannelReadyPeer> channelPeerRanks;
+    channelPeerRanks.reserve(pendingCreatedPeerRanks.size());
+    for (const auto &item : options.options) {
+        const auto peerRank = item.first;
+        if (pendingCreatedPeerRanks.count(peerRank) != 0U) {
+            channelPeerRanks.push_back({remoteRanks_.at(peerRank).channel, peerRank});
+        }
+    }
+    auto ret = HcommApiWrapper::WaitForChannelsReady(channelPeerRanks);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("device_urma Prepare WaitForChannelsReady failed, localRank: "
+                     << rankId_ << " pendingPeerCount: " << pendingCreatedPeerRanks.size() << " ret: " << ret);
+        RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
+        return ret;
+    }
+
+    for (const auto &item : options.options) {
+        const auto peerRank = item.first;
+        if (peerRank == rankId_) {
+            continue;
+        }
+        auto &state = remoteRanks_.at(peerRank);
+        const bool resourcesCreatedInThisCall = pendingCreatedPeerRanks.count(peerRank) != 0U;
 
         // 8. Import remote memory keys (always, even if channel/thread were reused)
-        ret = ImportRemoteMemKeysLocked(peerRank, state, item.second.memKeys);
+        ret = ImportRemoteMemKeysLocked(peerRank, state, options.options.at(peerRank).memKeys);
         if (ret != BM_OK) {
             BM_LOG_ERROR("device_urma Prepare ImportRemoteMemKeysLocked failed, peer: " << peerRank);
-            if (resourcesCreatedInThisCall) {
-                // Rollback the channel/thread that were just created in this call
-                BM_LOG_WARN("device_urma Prepare rolling back newly created channel/thread for peer: " << peerRank);
-                if (state.channel != 0) {
-                    auto chanRollback = state.channel;
-                    // No stream sync needed: channel was just created, no RemoteIO launched during Prepare.
-                    (void)DlHcommApi::HcommChannelDestroy(&chanRollback, 1);
-                    state.channel = 0;
-                }
-                if (state.thread != 0) {
-                    auto threadRollback = state.thread;
-                    (void)DlHcommApi::HcommThreadFree(&threadRollback, 1);
-                    state.thread = 0;
-                }
-                state.channelDesc = {};
-                state.remoteEndpointDesc = UrmaEndpointDesc{};
-                state.hasEndpointDesc = false;
-            }
-            // If resourcesCreatedInThisCall is false, ImportRemoteMemKeysLocked already
-            // rolled back its own partial imports; we leave pre-existing channel/thread intact.
+            RollbackPendingPrepareResourcesLocked(pendingCreatedPeerRanks);
             return ret;
         }
 
         BM_LOG_INFO("device_urma Prepare success, peer: " << peerRank << " thread: " << state.thread << " channel: "
                                                           << state.channel << " imports: " << state.imports.size());
+        if (resourcesCreatedInThisCall) {
+            pendingCreatedPeerRanks.erase(peerRank);
+        }
     }
     return BM_OK;
+}
+
+void DeviceUrmaTransportManager::RollbackPendingPrepareResourcesLocked(const std::set<uint32_t> &peerRanks)
+{
+    for (const auto peerRank : peerRanks) {
+        auto stateIt = remoteRanks_.find(peerRank);
+        if (stateIt == remoteRanks_.end()) {
+            continue;
+        }
+        const auto ret = CleanupPeerRankState(stateIt->second, peerRank);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("device_urma Prepare rollback pending resources failed, localRank: "
+                         << rankId_ << " peerRank: " << peerRank << " ret: " << ret);
+        }
+        remoteRanks_.erase(stateIt);
+    }
 }
 
 void DeviceUrmaTransportManager::MarkRanksFaulted(const std::vector<uint32_t> &ranks)

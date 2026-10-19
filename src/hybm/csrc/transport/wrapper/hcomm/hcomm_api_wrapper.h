@@ -10,6 +10,7 @@
 #ifndef MF_HYBRID_HCOMM_API_WRAPPER_H
 #define MF_HYBRID_HCOMM_API_WRAPPER_H
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -25,6 +26,11 @@ namespace device {
 
 using HcommEndpointHandle = void *;
 using HcommMemHandleType = void *;
+
+struct HcommChannelReadyPeer {
+    ChannelHandle channel{0};
+    uint32_t peerRank{0};
+};
 
 // ─────────────────────────────────────────────────────────────────
 // MemEntry: cached memory registration entry
@@ -118,8 +124,8 @@ public:
                                 ChannelHandle &channel);
     static Result DestroyChannel(ChannelHandle &channel);
     static Result GetChannelStatus(ChannelHandle &channel, int32_t &status);
-    static Result WaitForChannelReady(ChannelHandle channel, uint32_t peerRank,
-                                      std::chrono::milliseconds timeout = std::chrono::seconds(100));
+    static Result WaitForChannelsReady(const std::vector<HcommChannelReadyPeer> &peerRanks,
+                                       std::chrono::milliseconds timeout = std::chrono::hours(2));
 
     // ── Raw (bypass cache) — for flag buffers, one-shot registration ──
     static Result RawMemReg(HcommEndpointHandle endpoint, const char *tag, const HcommCommMem &mem,

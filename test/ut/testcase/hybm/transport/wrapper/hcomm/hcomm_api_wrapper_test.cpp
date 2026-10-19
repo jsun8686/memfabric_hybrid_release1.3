@@ -167,6 +167,7 @@ struct DlHcommApiGuard {
     hcommThreadFreeFunc oldThreadFree{DlHcommApi::gHcommThreadFree};
     hcommChannelCreateFunc oldChannelCreate{DlHcommApi::gHcommChannelCreate};
     hcommChannelDestroyFunc oldChannelDestroy{DlHcommApi::gHcommChannelDestroy};
+    hcommChannelGetStatusFunc oldChannelGetStatus{DlHcommApi::gHcommChannelGetStatus};
 
     ~DlHcommApiGuard()
     {
@@ -181,6 +182,7 @@ struct DlHcommApiGuard {
         DlHcommApi::gHcommThreadFree = oldThreadFree;
         DlHcommApi::gHcommChannelCreate = oldChannelCreate;
         DlHcommApi::gHcommChannelDestroy = oldChannelDestroy;
+        DlHcommApi::gHcommChannelGetStatus = oldChannelGetStatus;
     }
 };
 
@@ -534,7 +536,7 @@ TEST(HcommApiWrapperTest, GetChannelStatus_Success)
     ASSERT_EQ(status, 0);
 }
 
-TEST(HcommApiWrapperTest, WaitForChannelReadyTimesOutWhenChannelStaysInProgress)
+TEST(HcommApiWrapperTest, WaitForChannelsReadyTimesOutWhenChannelStaysInProgress)
 {
     DlHcommApiGuard guard;
     DlHcommApi::gHcommChannelGetStatus = [](ChannelHandle *, uint32_t, int32_t *status) -> int32_t {
@@ -543,12 +545,51 @@ TEST(HcommApiWrapperTest, WaitForChannelReadyTimesOutWhenChannelStaysInProgress)
     };
 
     const ChannelHandle channel = 0xA003UL;
+    const std::vector<HcommChannelReadyPeer> peerRanks{{channel, 3U}};
     const auto start = std::chrono::steady_clock::now();
-    const auto ret = HcommApiWrapper::WaitForChannelReady(channel, 3, std::chrono::milliseconds(5));
+    const auto ret = HcommApiWrapper::WaitForChannelsReady(peerRanks, std::chrono::milliseconds(5));
     const auto elapsed = std::chrono::steady_clock::now() - start;
 
     EXPECT_EQ(ret, BM_TIMEOUT);
     EXPECT_LT(elapsed, std::chrono::seconds(1));
+}
+
+TEST(HcommApiWrapperTest, WaitForChannelsReadyPollsEveryPendingChannel)
+{
+    static constexpr ChannelHandle firstChannel = 0xA003UL;
+    static constexpr ChannelHandle secondChannel = 0xA004UL;
+    static constexpr int32_t channelReady = 0;
+    static constexpr int32_t channelInProgress = 1;
+    static constexpr int32_t channelFailed = 2;
+    static bool secondChannelPolled = false;
+    static uint32_t firstChannelPollCount = 0U;
+    static uint32_t secondChannelPollCount = 0U;
+    secondChannelPolled = false;
+    firstChannelPollCount = 0U;
+    secondChannelPollCount = 0U;
+
+    DlHcommApiGuard guard;
+    DlHcommApi::gHcommChannelGetStatus = [](const ChannelHandle *channels, uint32_t channelCount,
+                                            int32_t *statuses) -> int32_t {
+        EXPECT_EQ(channelCount, 1U);
+        if (channels[0] == firstChannel) {
+            ++firstChannelPollCount;
+            statuses[0] = secondChannelPolled ? channelReady : channelInProgress;
+        } else if (channels[0] == secondChannel) {
+            ++secondChannelPollCount;
+            secondChannelPolled = true;
+            statuses[0] = channelReady;
+        } else {
+            ADD_FAILURE() << "unexpected channel: " << channels[0];
+            statuses[0] = channelFailed;
+        }
+        return 0;
+    };
+
+    const std::vector<HcommChannelReadyPeer> peerRanks{{firstChannel, 1U}, {secondChannel, 2U}};
+    EXPECT_EQ(HcommApiWrapper::WaitForChannelsReady(peerRanks, std::chrono::seconds(1)), BM_OK);
+    EXPECT_EQ(firstChannelPollCount, 2U);
+    EXPECT_EQ(secondChannelPollCount, 1U);
 }
 
 // ── DlAclApi wrapper tests ──

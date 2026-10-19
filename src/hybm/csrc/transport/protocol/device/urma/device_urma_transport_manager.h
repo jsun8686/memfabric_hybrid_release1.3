@@ -324,6 +324,7 @@ private:
                                      const std::vector<TransportMemoryKey> &memKeys);
 
     // Prepare/rank/connection/private data
+    void RollbackPendingPrepareResourcesLocked(const std::set<uint32_t> &peerRanks);
     Result RemoveRankLocked(uint32_t rankId);
 
     // Data transfer/copy

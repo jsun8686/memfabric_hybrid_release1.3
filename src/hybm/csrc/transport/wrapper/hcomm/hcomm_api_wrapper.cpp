@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -361,52 +362,80 @@ constexpr int32_t HCOMM_CHANNEL_READY = 0;
 constexpr int32_t HCOMM_CHANNEL_IN_PROGRESS = 1;
 constexpr int32_t HCOMM_CHANNEL_FAILED = 2;
 constexpr int32_t HCOMM_CHANNEL_TIMEOUT = 3;
+constexpr auto HCOMM_CHANNEL_POLL_INTERVAL = std::chrono::milliseconds(100);
+
+std::string DescribePeerRanks(const std::vector<HcommChannelReadyPeer> &peerRanks)
+{
+    std::ostringstream stream;
+    stream << "[";
+    for (size_t index = 0; index < peerRanks.size(); ++index) {
+        if (index != 0U) {
+            stream << ", ";
+        }
+        stream << peerRanks[index].peerRank;
+    }
+    stream << "]";
+    return stream.str();
+}
 } // namespace
 
-Result HcommApiWrapper::WaitForChannelReady(ChannelHandle channel, uint32_t peerRank, std::chrono::milliseconds timeout)
+Result HcommApiWrapper::WaitForChannelsReady(const std::vector<HcommChannelReadyPeer> &peerRanks,
+                                             std::chrono::milliseconds timeout)
 {
-    constexpr auto pollInterval = std::chrono::milliseconds(1);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    if (peerRanks.empty()) {
+        return BM_OK;
+    }
 
-    int32_t channelStatus = HCOMM_CHANNEL_IN_PROGRESS;
-    while (channelStatus == HCOMM_CHANNEL_IN_PROGRESS) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            break;
-        }
-        auto ret = DlHcommApi::HcommChannelGetStatus(&channel, 1, &channelStatus);
-        if (ret != 0) {
-            BM_LOG_ERROR("HcommChannelGetStatus failed, channel: " << channel << " peer: " << peerRank
-                                                                   << " ret: " << ret);
-            return BM_DL_FUNCTION_FAILED;
-        }
-        if (channelStatus == HCOMM_CHANNEL_IN_PROGRESS) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                break;
+    const auto startTime = std::chrono::steady_clock::now();
+    const auto deadline = startTime + timeout;
+    auto pendingPeerRanks = peerRanks;
+
+    while (!pendingPeerRanks.empty() && std::chrono::steady_clock::now() < deadline) {
+        // Poll every pending channel once per round. Blocking on one channel can form a cycle when peers choose
+        // different first channels, even though all channel handles have already been created.
+        for (auto peerIt = pendingPeerRanks.begin(); peerIt != pendingPeerRanks.end();) {
+            int32_t channelStatus = HCOMM_CHANNEL_IN_PROGRESS;
+            auto ret = DlHcommApi::HcommChannelGetStatus(&peerIt->channel, 1, &channelStatus);
+            if (ret != 0) {
+                BM_LOG_ERROR("HcommChannelGetStatus failed, channel: " << peerIt->channel << " peer: "
+                                                                       << peerIt->peerRank << " ret: " << ret);
+                return BM_DL_FUNCTION_FAILED;
             }
-            const auto nextPoll = now + pollInterval;
+            if (channelStatus == HCOMM_CHANNEL_READY) {
+                peerIt = pendingPeerRanks.erase(peerIt);
+                continue;
+            }
+            if (channelStatus == HCOMM_CHANNEL_FAILED) {
+                BM_LOG_ERROR("channel FAILED, channel: " << peerIt->channel << " peer: " << peerIt->peerRank);
+                return BM_NOT_CONNECTED;
+            }
+            if (channelStatus == HCOMM_CHANNEL_TIMEOUT) {
+                BM_LOG_ERROR("channel TIMEOUT, channel: " << peerIt->channel << " peer: " << peerIt->peerRank);
+                return BM_TIMEOUT;
+            }
+            if (channelStatus != HCOMM_CHANNEL_IN_PROGRESS) {
+                BM_LOG_ERROR("channel unknown status, channel: " << peerIt->channel << " peer: " << peerIt->peerRank
+                                                                 << " status: " << channelStatus);
+                return BM_DL_FUNCTION_FAILED;
+            }
+            ++peerIt;
+        }
+        if (!pendingPeerRanks.empty()) {
+            const auto now = std::chrono::steady_clock::now();
+            BM_LOG_INFO_LIMIT("pendingPeerCount: " << pendingPeerRanks.size() << ","
+                                                   << " In Progress PeerRanks: "
+                                                   << DescribePeerRanks(pendingPeerRanks));
+            const auto nextPoll = now + HCOMM_CHANNEL_POLL_INTERVAL;
             std::this_thread::sleep_until(nextPoll < deadline ? nextPoll : deadline);
         }
     }
-    if (channelStatus == HCOMM_CHANNEL_IN_PROGRESS) {
-        BM_LOG_ERROR("channel wait TIMEOUT, channel: " << channel << " peerRank: " << peerRank << " timeout_ms: "
-                                                       << timeout.count() << " status: " << channelStatus);
-        return BM_TIMEOUT;
+
+    for (const auto &peer : pendingPeerRanks) {
+        BM_LOG_ERROR("channel wait TIMEOUT, channel: " << peer.channel << " peerRank: " << peer.peerRank
+                                                       << " timeout_ms: " << timeout.count()
+                                                       << " status: " << HCOMM_CHANNEL_IN_PROGRESS);
     }
-    if (channelStatus == HCOMM_CHANNEL_READY) {
-        return BM_OK;
-    }
-    if (channelStatus == HCOMM_CHANNEL_FAILED) {
-        BM_LOG_ERROR("channel FAILED, channel: " << channel << " peer: " << peerRank);
-        return BM_NOT_CONNECTED;
-    }
-    if (channelStatus == HCOMM_CHANNEL_TIMEOUT) {
-        BM_LOG_ERROR("channel TIMEOUT, channel: " << channel << " peer: " << peerRank);
-        return BM_TIMEOUT;
-    }
-    BM_LOG_ERROR("channel unknown status, channel: " << channel << " peer: " << peerRank
-                                                     << " status: " << channelStatus);
-    return BM_DL_FUNCTION_FAILED;
+    return pendingPeerRanks.empty() ? BM_OK : BM_TIMEOUT;
 }
 
 // ── Raw (bypass cache) ──

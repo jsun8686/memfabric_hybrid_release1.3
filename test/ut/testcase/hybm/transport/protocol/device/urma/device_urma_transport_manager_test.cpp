@@ -575,6 +575,18 @@ int32_t MockHcommChannelCreateZero(EndpointHandle endpoint, CommEngine engine, H
 static int g_getStatusCallCount = 0;
 static int g_channelDestroyCallCount = 0;
 static int g_threadFreeCallCount = 0;
+enum class PrepareEvent : uint8_t {
+    CHANNEL_CREATE,
+    CHANNEL_STATUS,
+};
+static std::vector<PrepareEvent> g_prepareEvents;
+
+int32_t MockHcommChannelCreateRecordOrder(EndpointHandle endpoint, CommEngine engine, HcommChannelDesc *channelDescs,
+                                          uint32_t channelNum, ChannelHandle *channels)
+{
+    g_prepareEvents.push_back(PrepareEvent::CHANNEL_CREATE);
+    return MockHcommChannelCreate(endpoint, engine, channelDescs, channelNum, channels);
+}
 
 int32_t MockHcommChannelGetStatusReady(const ChannelHandle *channelList, uint32_t listNum, int32_t *statusList)
 {
@@ -584,6 +596,12 @@ int32_t MockHcommChannelGetStatusReady(const ChannelHandle *channelList, uint32_
     EXPECT_NE(statusList, nullptr);
     *statusList = 0UL; // READY
     return BM_OK;
+}
+
+int32_t MockHcommChannelGetStatusRecordOrder(const ChannelHandle *channelList, uint32_t listNum, int32_t *statusList)
+{
+    g_prepareEvents.push_back(PrepareEvent::CHANNEL_STATUS);
+    return MockHcommChannelGetStatusReady(channelList, listNum, statusList);
 }
 
 int32_t MockHcommChannelGetStatusInProgressThenReady(const ChannelHandle *channelList, uint32_t listNum,
@@ -1534,6 +1552,73 @@ TEST(DeviceUrmaTransportManagerTest, PrepareCreatesThreadChannelAndImportsMemKey
     EXPECT_EQ(state.imports.front().addr, MOCK_REMOTE_ADDR);
 }
 
+TEST(DeviceUrmaTransportManagerTest, PrepareCreatesAllChannelsBeforeWaitingForReady)
+{
+    constexpr uint32_t kPeerCount = 3U;
+    DlHcommApiFnGuard guard;
+    DlHcommApi::gHcommThreadAlloc = MockHcommThreadAlloc;
+    DlHcommApi::gHcommChannelCreate = MockHcommChannelCreateRecordOrder;
+    DlHcommApi::gHcommChannelGetStatus = MockHcommChannelGetStatusRecordOrder;
+    DlHcommApi::gHcommChannelDestroy = MockHcommChannelDestroy;
+    DlHcommApi::gHcommThreadFree = MockHcommThreadFree;
+
+    DeviceUrmaTransportManager manager;
+    manager.opened_ = true;
+    manager.rankId_ = 0U;
+    manager.rankCount_ = kPeerCount + 1U;
+    manager.localEndpoint_.push_back(MOCK_ENDPOINT);
+    manager.localEndpointDesc_.push_back(MakeEndpointDesc());
+
+    HybmTransPrepareOptions options{};
+    for (uint32_t peerRank = 1U; peerRank <= kPeerCount; ++peerRank) {
+        TransportRankPrepareInfo info{};
+        info.privateData = MakePrivateData(MakeEndpointDesc());
+        info.role = HYBM_ROLE_PEER;
+        options.options.emplace(peerRank, std::move(info));
+    }
+
+    g_prepareEvents.clear();
+    ASSERT_EQ(manager.Prepare(options), BM_OK);
+    ASSERT_EQ(g_prepareEvents.size(), kPeerCount * 2U);
+    for (size_t i = 0U; i < kPeerCount; ++i) {
+        EXPECT_EQ(g_prepareEvents[i], PrepareEvent::CHANNEL_CREATE);
+        EXPECT_EQ(g_prepareEvents[i + kPeerCount], PrepareEvent::CHANNEL_STATUS);
+    }
+}
+
+TEST(DeviceUrmaTransportManagerTest, PrepareWaitFailureRollsBackRemainingPendingChannels)
+{
+    constexpr uint32_t kPeerCount = 3U;
+    DlHcommApiFnGuard guard;
+    DlHcommApi::gHcommThreadAlloc = MockHcommThreadAlloc;
+    DlHcommApi::gHcommChannelCreate = MockHcommChannelCreate;
+    DlHcommApi::gHcommChannelGetStatus = MockHcommChannelGetStatusFailed;
+    DlHcommApi::gHcommChannelDestroy = MockHcommChannelDestroyCounted;
+    DlHcommApi::gHcommThreadFree = MockHcommThreadFreeCounted;
+
+    DeviceUrmaTransportManager manager;
+    manager.opened_ = true;
+    manager.rankId_ = 0U;
+    manager.rankCount_ = kPeerCount + 1U;
+    manager.localEndpoint_.push_back(MOCK_ENDPOINT);
+    manager.localEndpointDesc_.push_back(MakeEndpointDesc());
+
+    HybmTransPrepareOptions options{};
+    for (uint32_t peerRank = 1U; peerRank <= kPeerCount; ++peerRank) {
+        TransportRankPrepareInfo info{};
+        info.privateData = MakePrivateData(MakeEndpointDesc());
+        info.role = HYBM_ROLE_PEER;
+        options.options.emplace(peerRank, std::move(info));
+    }
+
+    g_channelDestroyCallCount = 0;
+    g_threadFreeCallCount = 0;
+    EXPECT_EQ(manager.Prepare(options), BM_NOT_CONNECTED);
+    EXPECT_EQ(g_channelDestroyCallCount, kPeerCount);
+    EXPECT_EQ(g_threadFreeCallCount, kPeerCount);
+    EXPECT_TRUE(manager.remoteRanks_.empty());
+}
+
 TEST(DeviceUrmaTransportManagerTest, PrepareUsesConfiguredUbQos)
 {
     ExpectPrepareWithQos(nullptr, 0U);
@@ -1934,8 +2019,8 @@ TEST(DeviceUrmaTransportManagerTest, PrepareRollsBackNewResourcesWhenImportFails
     DlHcommApi::gHcommChannelCreate = MockHcommChannelCreate;
     DlHcommApi::gHcommChannelGetStatus = MockHcommChannelGetStatusReady;
     DlHcommApi::gHcommMemImport = MockHcommMemImportFail;
-    DlHcommApi::gHcommChannelDestroy = MockHcommChannelDestroy;
-    DlHcommApi::gHcommThreadFree = MockHcommThreadFree;
+    DlHcommApi::gHcommChannelDestroy = MockHcommChannelDestroyCounted;
+    DlHcommApi::gHcommThreadFree = MockHcommThreadFreeCounted;
 
     DeviceUrmaTransportManager manager;
     manager.opened_ = true;
@@ -1952,11 +2037,12 @@ TEST(DeviceUrmaTransportManagerTest, PrepareRollsBackNewResourcesWhenImportFails
     info.memKeys = {MakeImportKey(MOCK_REMOTE_ADDR, MOCK_SIZE, MOCK_MEM_TAG)};
     options.options.emplace(1, std::move(info));
 
+    g_channelDestroyCallCount = 0;
+    g_threadFreeCallCount = 0;
     EXPECT_EQ(manager.Prepare(options), BM_DL_FUNCTION_FAILED);
-    ASSERT_TRUE(manager.remoteRanks_.count(1) != 0);
-    EXPECT_EQ(manager.remoteRanks_[1].channel, 0U);
-    EXPECT_EQ(manager.remoteRanks_[1].thread, 0U);
-    EXPECT_TRUE(manager.remoteRanks_[1].imports.empty());
+    EXPECT_EQ(g_channelDestroyCallCount, 1);
+    EXPECT_EQ(g_threadFreeCallCount, 1);
+    EXPECT_TRUE(manager.remoteRanks_.empty());
 }
 
 TEST(DeviceUrmaTransportManagerTest, PrepareRejectsRankEdgesAndChangedEndpoint)
