@@ -618,8 +618,6 @@ Result DataOpDeviceURMA::BatchDataCopyLocalBatch(hybm_batch_copy_params &params,
     auto ret = DlAclApi::AclrtMemcpyBatch(params.destinations, sizes.data(), params.sources, sizes.data(), sizes.size(),
                                           attrs.data(), attrsIds.data(), attrs.size(), &fail_idx);
     if (ret != 0) {
-        BM_LOG_WARN("AclrtMemcpyBatch failed, ret: " << ret << " fail_idx: " << fail_idx << " direction: " << direction
-                                                     << " batchSize: " << batchNum << ", fallback to async");
         return BatchDataCopyLocalAsync(params, direction, options);
     }
     return ret;
