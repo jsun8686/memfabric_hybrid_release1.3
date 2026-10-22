@@ -30,9 +30,8 @@ jobs:
           fetch-depth: 0
 
       - name: Generate notes and publish
-        env:
-          GITCODE_TOKEN: ${{ secrets.MF_RELEASE_TOKEN }}
         run: |
+          export GITCODE_TOKEN='${{ secrets.MF_RELEASE_TOKEN }}'
           git fetch --tags --force
           python3 script/gitcode_release.py \
             --repo "$ATOMGIT_REPOSITORY" \
