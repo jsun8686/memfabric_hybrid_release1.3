@@ -676,6 +676,7 @@ Result AccTcpServerDefault::Handshake(int &tmpFD, const AccConnReq &connReq, con
     result = tmpLink->Initialize(options_.linkSendQueueSize, workIndex, worker.Get());
     if (UNLIKELY(result != ACC_OK)) {
         LOG_ERROR("Failed to initialize the link from " << tmpLink->ShortName() << ", result " << result);
+        WorkerLinkCntUpdate(workIndex);
         return ACC_ERROR;
     }
 
@@ -688,6 +689,7 @@ Result AccTcpServerDefault::Handshake(int &tmpFD, const AccConnReq &connReq, con
         auto iter = connectedLinks_.find(tmpLink->Id());
         if (iter != connectedLinks_.end()) {
             LOG_ERROR("Failed to handle new connection as found duplicated link id " << tmpLink->Id());
+            WorkerLinkCntUpdate(workIndex);
             return ACC_ERROR;
         }
 
@@ -695,6 +697,7 @@ Result AccTcpServerDefault::Handshake(int &tmpFD, const AccConnReq &connReq, con
         /* added to worker */
         result = worker->AddLink(linkDefault, EPOLLIN | EPOLLOUT | EPOLLET);
         if (UNLIKELY(result != ACC_OK)) {
+            WorkerLinkCntUpdate(workIndex);
             return result;
         }
 
@@ -746,6 +749,34 @@ Result AccTcpServerDefault::HandleLinkBroken(const AccTcpLinkDefaultPtr &link)
     }
 
     return ACC_OK;
+}
+
+Result AccTcpServerDefault::ReleaseLink(const AccTcpLinkComplexPtr &link)
+{
+    ASSERT_RETURN(link.Get() != nullptr, ACC_INVALID_PARAM);
+    auto *defaultLink = dynamic_cast<AccTcpLinkDefault *>(link.Get());
+    ASSERT_RETURN(defaultLink != nullptr, ACC_INVALID_PARAM);
+
+    {
+        // 只处理本 server 当前接管的链路：传入陌生 link（别的 server 实例的链路，或已释放的链路）时，
+        // 下方 HandleLinkBroken 在 connectedLinks_ 中查不到条目却仍会继续，去动 worker 的 epoll 与
+        // 连接配额计数，静默破坏 WorkerSelect 的配额；这里先行拦截。
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (connectedLinks_.find(link->Id()) == connectedLinks_.end()) {
+            LOG_ERROR("Failed to release link " << link->Id() << " which is not a link of this server");
+            return ACC_INVALID_PARAM;
+        }
+    }
+
+    // 复用既有断链路径：Break -> 清理排队消息 -> 回调上层 LinkBrokenHandler（业务侧簿记）->
+    // RemoveLink（递减 worker 引用）/ delayCleanup / connectedLinks_ 摘除
+    Result ret = HandleLinkBroken(AccTcpLinkDefaultPtr(defaultLink));
+
+    // 清理完再关 fd，立即向对端发 FIN 让其感知并重连。顺序不能反：Close() 会把 established_ 置 0，
+    // 使上面的 Break() 早退；而 RemoveLink() 在 fd_ == -1 时也会提前返回，
+    // acc 侧引用与 connectedLinks_ 条目就要等到 Stop() 才能释放。
+    link->Close();
+    return ret;
 }
 
 } // namespace acc

@@ -45,6 +45,7 @@ public:
     virtual Result HandleRequestSent(AccMsgSentResult msgResult, const AccMsgHeader &header,
                                      const AccDataBufferPtr &cbCtx);
     virtual Result HandleLinkBroken(const AccTcpLinkDefaultPtr &link);
+    Result ReleaseLink(const AccTcpLinkComplexPtr &link) override;
 
 protected:
     void StopAndCleanWorkers(bool afterFork = false);

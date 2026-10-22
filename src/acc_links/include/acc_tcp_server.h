@@ -143,6 +143,28 @@ public:
     virtual void RegisterLinkBrokenHandler(const AccLinkBrokenHandler &h) = 0;
 
     /**
+     * @brief Release a link which the caller has decided is no longer usable, e.g. the peer's
+     *        heartbeat timed out while the link still looks established.
+     *
+     * The link must be a link currently managed by this server; a foreign link (created by another
+     * server instance) or an already released link is rejected.
+     *
+     * The standard broken-link path is reused: breaks the link, drains the messages still queued
+     * on it, invokes the registered LinkBrokenHandler (so the upper layer can drop its own
+     * bookkeeping), then removes the link from worker/connection tables and closes the fd so that
+     * the peer notices the disconnection and reconnects.
+     *
+     * Use this instead of AccTcpLink::Close() alone: Close() only shuts the fd down, it does not
+     * release the acc side references (worker reference and connected link entry), so the link
+     * object is never destroyed and its bookkeeping is never released.
+     *
+     * @param link         [in] link to release, expected to be established and managed by this server
+     * @return 0 if the link was broken by this call, ACC_INVALID_PARAM if the link is null, not
+     *         established / not managed by this server, or has already been released
+     */
+    virtual Result ReleaseLink(const AccTcpLinkComplexPtr &link) = 0;
+
+    /**
      * @brief Register the handler for new link connected
      *
      * @param h            [in] handler

@@ -1297,6 +1297,8 @@ void AccStoreServer::CheckerThreadTask() noexcept
     pthread_setname_np(pthread_self(), "store_chk_sts");
     const auto timeout = std::chrono::seconds(heartBeatTimeoutS_);
     std::unordered_set<uint32_t> brokenLinks;
+    // 心跳超时链路的句柄快照：摘除 rank 后仍需主动关闭该 TCP 链路（见下方说明）
+    std::vector<ock::acc::AccTcpLinkComplexPtr> expiredLinks;
     std::unique_lock<std::mutex> lockerGuard{storeMutex_};
     while (state_.load() != SS_EXITED) {
         auto curTime = mf::StrUtil::GetNowTime();
@@ -1304,15 +1306,49 @@ void AccStoreServer::CheckerThreadTask() noexcept
             if (heartBeatTimeoutS_ > 0 && std::chrono::milliseconds(curTime - it->second) >= timeout) {
                 STORE_LOG_TRACE("link(" << it->first << ") heartbeat expired, timeoutS=" << heartBeatTimeoutS_);
                 brokenLinks.insert(it->first);
+                // 在摘除 rank 前先取出链路句柄（linkRankMap_/rankLinks_ 均由 storeMutex_ 保护）
+                auto rankIt = linkRankMap_.find(it->first);
+                if (rankIt != linkRankMap_.end()) {
+                    auto linkIt = rankLinks_.find(rankIt->second);
+                    if (linkIt != rankLinks_.end() && linkIt->second != nullptr) {
+                        expiredLinks.push_back(linkIt->second);
+                    }
+                }
                 it = heartBeatMap_.erase(it);
             } else {
                 ++it;
             }
         }
         lockerGuard.unlock();
+        // 心跳超时链路走 acc 的标准断链清理：Break -> 回调本类 LinkBrokenHandler（rank 簿记 + meta 侧
+        // 资源回收）-> RemoveLink / delayCleanup / connectedLinks_ 摘除，最后关闭 fd 触发对端重连。
+        // 不能只调 link->Close()：Close() 会把 established_ 置 0、并让 RemoveLink 因 fd_ == -1 提前返回，
+        // acc 侧引用与 connectedLinks_ 条目就不会释放（要等 Stop()），link 对象也不会析构。
+        std::unordered_set<uint32_t> releasedLinkIds;
+        for (auto &link : expiredLinks) {
+            if (link == nullptr || !link->Established()) {
+                continue;
+            }
+            STORE_LOG_WARN("link(" << link->Id() << ") heartbeat timeout, release link to trigger peer reconnect");
+            if (accTcpServer_ != nullptr) {
+                // 仅当 acc 真正完成了标准断链清理（上层 LinkBrokenHandler 已被回调）时才跳过下面的本地簿记；
+                // 链路已不在 acc 管辖范围（例如已被 worker 断链路径清理）时会返回错误，由下面循环兜底。
+                if (accTcpServer_->ReleaseLink(link) == ock::acc::ACC_OK) {
+                    releasedLinkIds.insert(link->Id());
+                }
+            } else {
+                // 兜底：acc server 不可用时至少显式断开，保证对端能感知（簿记由下方循环处理）
+                link->Close();
+            }
+        }
+        // 没有句柄（链路未映射到 rank）的超时 link 仍做本地簿记，保持既有行为
         for (auto linkId : brokenLinks) {
+            if (releasedLinkIds.find(linkId) != releasedLinkIds.end()) {
+                continue; // 已在 ReleaseLink 回调的 LinkBrokenHandler 中完成
+            }
             LinkBrokenHandler(linkId); // private func, locks storeMutex_ internally
         }
+        expiredLinks.clear();
         lockerGuard.lock();
         brokenLinks.clear();
         storeCond_.wait_for(lockerGuard, std::chrono::milliseconds(HEARTBEAT_INTERVAL),

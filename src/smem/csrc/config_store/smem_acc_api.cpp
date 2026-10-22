@@ -372,6 +372,20 @@ uint64_t LinkGetContext(smem_acc_link_t link)
     return native == nullptr || *native == nullptr ? 0 : (*native)->UpCtx();
 }
 
+int32_t ServerReleaseLink(smem_acc_server_t server, smem_acc_link_t link)
+{
+    auto *runtime = AsServer(server);
+    auto *native = AsLink(link);
+    const bool serverReady = runtime != nullptr && runtime->tcp != nullptr;
+    const bool linkReady = native != nullptr && *native != nullptr;
+    if (!serverReady || !linkReady) {
+        SM_LOG_ERROR("Invalid release link parameters, server is null: " << (!serverReady)
+                                                                         << ", link is null: " << (!linkReady));
+        return acc::ACC_INVALID_PARAM;
+    }
+    return runtime->tcp->ReleaseLink(*native);
+}
+
 int32_t LinkSend(smem_acc_link_t link, int16_t type, int16_t result, uint32_t sequence, const void *data,
                  uint32_t dataLen)
 {
@@ -559,6 +573,11 @@ SMEM_API int32_t smem_acc_http_server_register_handler(smem_acc_server_t server,
                                                        smem_acc_http_cb callback, void *context)
 {
     return HttpServerRegisterHandler(server, method, path, callback, context);
+}
+
+SMEM_API int32_t smem_acc_server_release_link(smem_acc_server_t server, smem_acc_link_t link)
+{
+    return ServerReleaseLink(server, link);
 }
 
 SMEM_API smem_acc_link_t smem_acc_link_retain(smem_acc_link_t link)

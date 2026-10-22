@@ -185,6 +185,24 @@ int32_t smem_acc_server_connect(smem_acc_server_t server, const char *peer_ip, u
                                 smem_acc_link_t *link);
 
 /**
+ * @brief Release a TCP link of this server which the caller has decided is no longer usable, e.g. the
+ *        peer's heartbeat timed out while the link still looks established.
+ *
+ * The link goes through the standard broken-link path: the registered link-broken handler is invoked
+ * (so the caller can drop its own bookkeeping), the link is removed from the server side bookkeeping
+ * and the fd is closed, so the peer notices the disconnection and reconnects.
+ *
+ * The link must be a link of this server, i.e. a link which the server currently manages; passing a
+ * foreign link (another server instance, or a link already released) is rejected.
+ *
+ * @param server           [in] server handle
+ * @param link             [in] link handle of a link currently managed by this server
+ * @return 0 if the link was released by this call, ACC_INVALID_PARAM if server/link is invalid or the
+ *         link is not a link currently managed by this server, or another ACC error code on failure
+ */
+int32_t smem_acc_server_release_link(smem_acc_server_t server, smem_acc_link_t link);
+
+/**
  * @brief Register a handler for an HTTP method and path.
  *
  * The request passed to the callback is borrowed and must not be used after the callback returns.
