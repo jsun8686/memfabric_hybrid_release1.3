@@ -146,12 +146,16 @@ typedef enum aclrtMemMallocPolicy {
     ACL_MEM_ACCESS_USER_SPACE_READONLY = 0x100000U,
 } aclrtMemMallocPolicy;
 
+constexpr uint64_t ACL_NOTIFY_FLAG_DEVICE_ONLY = 0x00000001U;
+
 using aclrtSetDeviceFunc = int32_t (*)(int32_t);
 using aclrtGetDeviceFunc = int32_t (*)(int32_t *);
 using aclrtDeviceEnablePeerAccessFunc = int32_t (*)(int32_t, uint32_t);
 using aclrtCreateStreamFunc = int (*)(void **);
 using aclrtCreateStreamWithConfigFunc = int (*)(void **, int32_t, uint32_t);
 using aclrtStreamGetIdFunc = int (*)(void *, int32_t *);
+using rtStreamGetSqidFunc = int32_t (*)(const void *, uint32_t *);
+using rtStreamGetCqidFunc = int32_t (*)(const void *, uint32_t *, uint32_t *);
 using aclrtCreateNotifyFunc = int (*)(void **, uint64_t);
 using aclrtGetNotifyIdFunc = int (*)(void *, uint32_t *);
 using aclrtDestroyNotifyFunc = int (*)(void *);
@@ -259,6 +263,22 @@ public:
             return BM_UNDER_API_UNLOAD;
         }
         return pAclrtStreamGetId(stream, streamId);
+    }
+
+    static inline Result RtStreamGetSqid(void *stream, uint32_t *sqId)
+    {
+        if (pRtStreamGetSqid == nullptr) {
+            return BM_UNDER_API_UNLOAD;
+        }
+        return pRtStreamGetSqid(stream, sqId);
+    }
+
+    static inline Result RtStreamGetCqid(void *stream, uint32_t *cqId, uint32_t *logicCqId)
+    {
+        if (pRtStreamGetCqid == nullptr) {
+            return BM_UNDER_API_UNLOAD;
+        }
+        return pRtStreamGetCqid(stream, cqId, logicCqId);
     }
 
     static inline Result AclrtCreateNotify(void **notify, uint64_t flag)
@@ -602,6 +622,8 @@ private:
     static aclrtCreateStreamFunc pAclrtCreateStream;
     static aclrtCreateStreamWithConfigFunc pAclrtCreateStreamWithConfig;
     static aclrtStreamGetIdFunc pAclrtStreamGetId;
+    static rtStreamGetSqidFunc pRtStreamGetSqid;
+    static rtStreamGetCqidFunc pRtStreamGetCqid;
     static aclrtCreateNotifyFunc pAclrtCreateNotify;
     static aclrtGetNotifyIdFunc pAclrtGetNotifyId;
     static aclrtDestroyNotifyFunc pAclrtDestroyNotify;

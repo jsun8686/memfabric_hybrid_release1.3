@@ -59,7 +59,6 @@ constexpr uint32_t HCOMM_CHANNEL_QOS_MAX = 7U;
 constexpr const char *HCOMM_CHANNEL_QOS_ENV = "MF_DEVICE_UB_QOS";
 constexpr const char *HYBM_DEVICE_FUNC_TRANSFER = "HybmBatchTransfer";
 constexpr uint32_t HYBM_DEVICE_KERNEL_BLOCK_DIM = 1U;
-constexpr uint32_t ACL_NOTIFY_FLAG_DEVICE_ONLY = 0x00000001U; // 使能该bit表示创建的Notify仅在Device上调用。
 constexpr uint16_t HYBM_DEVICE_KERNEL_TIMEOUT_S = 60U;
 constexpr uint32_t HYBM_NOTIFY_DEFAULT_WAIT_TIME_S = 27U * 68U;
 uint32_t GetHcommChannelQos()

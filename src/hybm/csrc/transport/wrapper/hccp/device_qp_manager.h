@@ -69,6 +69,10 @@ public:
     virtual const void *GetQpInfoAddress() const noexcept;
     virtual UserQpInfo *GetQpHandleWithRankId(uint32_t rankId) noexcept = 0;
     virtual void PutQpHandle(UserQpInfo *qp) const noexcept = 0;
+    virtual uint64_t GetDeviceQpAddr(uint32_t rankId) const noexcept
+    {
+        return 0;
+    }
     virtual bool CheckQpReady(const std::vector<uint32_t> &rankIds) const noexcept;
     virtual std::string GetErrorConnectionsStatus(const std::vector<uint32_t> &rankIds) const noexcept;
 

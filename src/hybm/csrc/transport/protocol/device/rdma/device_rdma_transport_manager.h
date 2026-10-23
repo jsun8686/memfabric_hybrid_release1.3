@@ -13,9 +13,7 @@
 #ifndef MF_HYBRID_DEVICE_RDMA_TRANSPORT_MANAGER_H
 #define MF_HYBRID_DEVICE_RDMA_TRANSPORT_MANAGER_H
 
-#include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include <map>
 #include <mutex>
@@ -86,7 +84,7 @@ public:
         return BM_OK;
     }
 
-private:
+protected:
     static bool PrepareOpenDevice(uint32_t userId, uint32_t device, uint32_t rankCount, in_addr &deviceIp,
                                   void *&rdmaHandle);
     static bool OpenTsd(uint32_t deviceId, uint32_t rankCount);
@@ -95,7 +93,7 @@ private:
     static bool RaRdevInit(uint32_t deviceId, in_addr deviceIp, void *&rdmaHandle);
     void ClearAllRegisterMRs();
     int CheckPrepareOptions(const HybmTransPrepareOptions &options);
-    int RemoteIO(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size, bool write, bool sync);
+    virtual int RemoteIO(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size, bool write, bool sync);
     int CorrectHostRegWr(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size, send_wr_v2 &wr);
     int ConvertHccpMrInfo(const TransportMemoryRegion &mr, HccpMrInfo &info);
     void OptionsToRankMRs(const HybmTransPrepareOptions &options);
@@ -104,7 +102,7 @@ private:
     int GetRegAddress(const MemoryRegionMap &map, uint64_t inputAddr, uint64_t size, bool isLocal, uint64_t &outputAddr,
                       uint32_t &mrKey) const;
 
-private: // RDMA HOST STARS
+protected: // RDMA HOST STARS
     void ConstructSqeNoSinkModeForRdmaDbSendTask(const send_wr_rsp &rspInfo, rtStarsSqe_t &command, HybmStreamPtr st);
     uint64_t GetRoceDbAddrForRdmaDbSendTask();
     int32_t InitStreamNotifyBuf();
@@ -112,7 +110,7 @@ private: // RDMA HOST STARS
     static void BuildTable(std::string &str, std::string &ip, uint32_t devId);
     static bool GetRdmaHandleAfterInitHccl(uint32_t device, in_addr &deviceIp, void *&rdmaHandle);
 
-private:
+protected:
     static thread_local HybmStreamNotifyPtr notify_;
     RdmaNotifyInfo notifyInfo_ = {};
     std::mutex mutex_;

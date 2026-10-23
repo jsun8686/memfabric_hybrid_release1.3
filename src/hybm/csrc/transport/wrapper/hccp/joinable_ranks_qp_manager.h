@@ -75,6 +75,13 @@ private:
     void FillHccpTag(char *output, uint32_t peerRank);
     void TrySetQos();
 
+protected:
+    virtual int CreateQpHandle(uint32_t rankId, void *&qpHandle) noexcept;
+    void *GetRdmaHandle() const noexcept
+    {
+        return rdmaHandle_;
+    }
+
 private:
     std::atomic<bool> started_{false};
     std::atomic<bool> running_{true};

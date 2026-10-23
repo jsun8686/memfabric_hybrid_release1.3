@@ -1371,7 +1371,7 @@ Result DeviceRdmaHcommTransportManager::EnsureContextInitLocked(CompletionContex
     }
 
     void *notify = nullptr;
-    auto ret = DlAclApi::AclrtCreateNotify(&notify, ACL_NOTIFY_DEVICE_USE_ONLY);
+    auto ret = DlAclApi::AclrtCreateNotify(&notify, ACL_NOTIFY_FLAG_DEVICE_ONLY);
     if (ret != BM_OK) {
         BM_LOG_ERROR("EnsureContextInitLocked AclrtCreateNotify failed, ret=" << ret);
         return ret;

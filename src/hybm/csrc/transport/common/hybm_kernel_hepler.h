@@ -45,6 +45,17 @@ Result LoadDeviceKernelAndGetHandles(const char *funcTransfer, aclrtBinHandle &b
 Result LoadDeviceKernelAndValidate(const char *funcRead, const char *funcWrite, aclrtBinHandle &binHandle,
                                    DeviceFuncHandles &funcHandles);
 
+// Load a single named AICPU kernel into the given aclrtFuncHandle (native RDMA path).
+// @param binHandle  [in/out] cached bin handle; if nullptr, loads from JSON
+// @param funcHandle [out] resolved function handle
+// @param funcName   kernel function name (e.g. "HybmRdmaAicpuPostSend")
+Result LoadDeviceKernelAndGetHandles(aclrtBinHandle &binHandle, aclrtFuncHandle &funcHandle, const char *funcName);
+
+// Common AICPU kernel launch sequence: ArgsInit/Append/Finalize + LaunchKernelWithConfig.
+// Shared by the HCOMM/URMA batch path (device_kernel_helper.h) and the native RDMA path
+// (rdma_aicpu_helper.h). Returns the first non-OK ret without logging; callers log with context.
+Result LaunchAicpuKernel(aclrtFuncHandle funcHandle, void *stream, const void *args, size_t argsBytes);
+
 } // namespace device
 } // namespace transport
 } // namespace mf

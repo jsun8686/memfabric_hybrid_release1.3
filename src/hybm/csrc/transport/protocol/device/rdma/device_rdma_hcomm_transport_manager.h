@@ -28,7 +28,6 @@ constexpr uint32_t DEVICE_RDMA_HCOMM_DEFAULT_SL = 4;
 // 显式设置重传参数；不设会留下 0xFF 的脏值
 constexpr uint32_t DEVICE_RDMA_HCOMM_DEFAULT_RETRY_CNT = 7;
 constexpr uint32_t DEVICE_RDMA_HCOMM_DEFAULT_RETRY_INTERVAL_MS = 20;
-constexpr uint32_t ACL_NOTIFY_DEVICE_USE_ONLY = 1;
 constexpr uint32_t DEFAULT_NOTIFY_NUM = 0;
 constexpr uint32_t HYBM_DEVICE_KERNEL_BLOCK_DIM = 1;
 constexpr uint32_t HYBM_NOTIFY_DEFAULT_WAIT_TIME_S = 600;

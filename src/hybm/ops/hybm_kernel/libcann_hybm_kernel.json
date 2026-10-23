@@ -19,5 +19,12 @@
             "kernelSo": "libcann_hybm_kernel.so",
             "opKernelLib": "AICPUKernel"
         }
+    },
+    "HybmRdmaAicpuPostSend": {
+        "opInfo": {
+            "functionName": "HybmRdmaAicpuPostSend",
+            "kernelSo": "libcann_hybm_kernel.so",
+            "opKernelLib": "AICPUKernel"
+        }
     }
 }

@@ -19,6 +19,7 @@
 #include "hybm_logger.h"
 #include "host_hcom_transport_manager.h"
 #include "device_rdma_transport_manager.h"
+#include "device_rdma_aicpu_transport_manager.h"
 #include "hybm_gva_version.h"
 #include "device_urma_transport_manager.h"
 #include "device_rdma_hcomm_transport_manager.h"
@@ -79,8 +80,17 @@ Result ComposeTransportManager::OpenDeviceTransport(const TransportOptions &opti
         if (useHcomm) {
             deviceTransportManager_ = std::make_shared<device::DeviceRdmaHcommTransportManager>();
         } else {
-            BM_LOG_INFO("using native device RDMA transport");
-            deviceTransportManager_ = std::make_shared<device::RdmaTransportManager>();
+            // AICPU 直发开关（默认关闭）：打开后用 AI QP + AICPU kernel 提交 WQE，host 仅敲 doorbell。
+            // 仅适用于非 HYBM_TYPE_AI_CORE_INITIATE 场景（AI_CORE_INITIATE 用 FixedRanksQpManager，走基类）。
+            static const bool aicpuEnabled = MfEnvUtil::GetOptionalUintOrDefault(env::MF_HYBM_RDMA_USE_AICPU, 0u) != 0u;
+            const bool useAicpu = aicpuEnabled && (options.initialType != HYBM_TYPE_AI_CORE_INITIATE);
+            if (useAicpu) {
+                BM_LOG_INFO("using AICPU device RDMA transport, rankId: " << options.rankId);
+                deviceTransportManager_ = std::make_shared<device::RdmaAicpuTransportManager>();
+            } else {
+                BM_LOG_INFO("using native device RDMA transport");
+                deviceTransportManager_ = std::make_shared<device::RdmaTransportManager>();
+            }
         }
     } else {
         BM_LOG_ERROR("Failed to open device transport with unsupported protocol: " << options.protocol
@@ -642,4 +652,12 @@ const TransportPrivateData ComposeTransportManager::GetPrivateData() const
         return deviceTransportManager_->GetPrivateData();
     }
     return TransportPrivateData{};
+}
+
+const void *ComposeTransportManager::GetQpInfo() const
+{
+    if (deviceTransportManager_ != nullptr) {
+        return deviceTransportManager_->GetQpInfo();
+    }
+    return nullptr;
 }

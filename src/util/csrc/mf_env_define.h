@@ -58,6 +58,8 @@ inline const std::string MF_HYBM_RDMA_FORCE_UNREGISTERED =
     GetEnvStr("MF_HYBM_RDMA_FORCE_UNREGISTERED", "HYBM_RDMA_FORCE_UNREGISTERED");
 // HCOMM 开关（默认关闭）：关闭时 DEVICE_RDMA 一律走 native；打开后按 CANN 版本判断
 inline const std::string MF_HYBM_RDMA_USE_HCOMM = GetEnvStr("MF_HYBM_RDMA_USE_HCOMM", "HYBM_RDMA_USE_HCOMM");
+// AICPU 直发开关（默认关闭）：打开时 DEVICE_RDMA 使用 AI QP，队列信息下发 device 供 AICPU kernel 直接下发任务
+inline const std::string MF_HYBM_RDMA_USE_AICPU = GetEnvStr("MF_HYBM_RDMA_USE_AICPU", "HYBM_RDMA_USE_AICPU");
 inline const std::string MF_HYBM_ENABLE_4K_PAGE = GetEnvStr("MF_HYBM_ENABLE_4K_PAGE", "HYBM_ENABLE_4K_PAGE");
 inline const std::string MF_HOST_SHM_USE_MEMFD = GetEnvStr("MF_HOST_SHM_USE_MEMFD");
 inline const std::string MF_LOG_LEVEL = GetEnvStr("MF_LOG_LEVEL", "ASCEND_MF_LOG_LEVEL");

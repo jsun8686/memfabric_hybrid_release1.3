@@ -32,6 +32,7 @@ endforeach()
 if(NOT DEFINED AICPU_KERNEL_SRC)
   set(AICPU_KERNEL_SRC
       "${CMAKE_CURRENT_SOURCE_DIR}/hybm_batch_transfer.cc"
+      "${CMAKE_CURRENT_SOURCE_DIR}/hybm_rdma_aicpu.cc"
   )
 endif()
 
@@ -49,6 +50,7 @@ add_custom_command(
 # ---- Cross-compile .so ----
 set(AICPU_KERNEL_DEPS
     ${CMAKE_CURRENT_SOURCE_DIR}/hybm_batch_transfer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/hybm_rdma_aicpu.h
     ${CMAKE_CURRENT_SOURCE_DIR}/hybm_kernel_log.h
     ${PROJECT_HYBM_SRC_BASE}/include/hybm_def.h
 )

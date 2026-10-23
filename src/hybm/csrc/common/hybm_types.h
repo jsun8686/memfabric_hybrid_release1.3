@@ -20,6 +20,7 @@ namespace ock {
 namespace mf {
 using Result = int32_t;
 constexpr uint32_t UN40 = 40;
+constexpr uint32_t UN1024 = 1024;
 } // namespace mf
 } // namespace ock
 

@@ -19,6 +19,7 @@
 #include <vector>
 #include "hybm_logger.h"
 #include "dl_acl_api.h"
+#include "hybm_kernel_hepler.h"
 #include "hybm_transport_common.h"
 #include "hybm_batch_transfer.h"
 
@@ -133,37 +134,10 @@ inline Result LaunchDeviceKernel(const KernelLaunchConfig &config, DeviceTransfe
     args.local_flag_addr = config.localFlagAddr;
     args.flag_size = config.flagSize;
 
-    aclrtArgsHandle argsHandle = nullptr;
-    ret = DlAclApi::AclrtKernelArgsInit(config.funcHandle, &argsHandle);
+    ret = LaunchAicpuKernel(config.funcHandle, config.stream, &args, sizeof(args));
     if (ret != BM_OK) {
-        BM_LOG_ERROR("LaunchDeviceKernel AclrtKernelArgsInit failed, ret=" << ret);
-        (void)DlAclApi::AclrtFree(dstListDev);
-        return ret;
-    }
-    aclrtParamHandle paramHandle = nullptr;
-    ret = DlAclApi::AclrtKernelArgsAppend(argsHandle, &args, sizeof(args), &paramHandle);
-    if (ret != BM_OK) {
-        BM_LOG_ERROR("LaunchDeviceKernel AclrtKernelArgsAppend failed, ret=" << ret);
-        (void)DlAclApi::AclrtFree(dstListDev);
-        return ret;
-    }
-    ret = DlAclApi::AclrtKernelArgsFinalize(argsHandle);
-    if (ret != BM_OK) {
-        BM_LOG_ERROR("LaunchDeviceKernel AclrtKernelArgsFinalize failed, ret=" << ret);
-        (void)DlAclApi::AclrtFree(dstListDev);
-        return ret;
-    }
-
-    aclrtLaunchKernelAttr attr{};
-    attr.id = aclrtLaunchKernelAttrId::ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
-    attr.value.timeout = static_cast<uint16_t>(27U * 68U);
-    aclrtLaunchKernelCfg cfg{};
-    cfg.attrs = &attr;
-    cfg.numAttrs = 1;
-    ret = DlAclApi::AclrtLaunchKernelWithConfig(config.funcHandle, 1U, config.stream, &cfg, argsHandle, nullptr);
-    if (ret != BM_OK) {
-        BM_LOG_ERROR("LaunchDeviceKernel AclrtLaunchKernelWithConfig failed, kernel="
-                     << (config.isRead ? "HybmBatchRead" : "HybmBatchWrite") << " ret=" << ret);
+        BM_LOG_ERROR("LaunchDeviceKernel launch failed, kernel=" << (config.isRead ? "HybmBatchRead" : "HybmBatchWrite")
+                                                                 << " ret=" << ret);
         (void)DlAclApi::AclrtFree(dstListDev);
         return ret;
     }

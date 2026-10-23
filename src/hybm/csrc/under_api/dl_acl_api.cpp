@@ -26,6 +26,8 @@ aclrtCreateStreamFunc DlAclApi::pAclrtCreateStream = nullptr;
 aclrtCreateStreamWithConfigFunc DlAclApi::pAclrtCreateStreamWithConfig = nullptr;
 
 aclrtStreamGetIdFunc DlAclApi::pAclrtStreamGetId = nullptr;
+rtStreamGetSqidFunc DlAclApi::pRtStreamGetSqid = nullptr;
+rtStreamGetCqidFunc DlAclApi::pRtStreamGetCqid = nullptr;
 aclrtCreateNotifyFunc DlAclApi::pAclrtCreateNotify = nullptr;
 aclrtGetNotifyIdFunc DlAclApi::pAclrtGetNotifyId = nullptr;
 aclrtDestroyNotifyFunc DlAclApi::pAclrtDestroyNotify = nullptr;
@@ -95,6 +97,8 @@ Result DlAclApi::LoadLibrary(const std::string &libDirPath)
     DL_LOAD_SYM(pAclrtCreateStream, aclrtCreateStreamFunc, rtHandle, "aclrtCreateStream");
     DL_LOAD_SYM(pAclrtCreateStreamWithConfig, aclrtCreateStreamWithConfigFunc, rtHandle, "aclrtCreateStreamWithConfig");
     DL_LOAD_SYM(pAclrtStreamGetId, aclrtStreamGetIdFunc, rtHandle, "aclrtStreamGetId");
+    DL_LOAD_SYM_OPTIONAL(pRtStreamGetSqid, rtStreamGetSqidFunc, rtHandle, "rtStreamGetSqid");
+    DL_LOAD_SYM_OPTIONAL(pRtStreamGetCqid, rtStreamGetCqidFunc, rtHandle, "rtStreamGetCqid");
     DL_LOAD_SYM(pAclrtCreateNotify, aclrtCreateNotifyFunc, rtHandle, "aclrtCreateNotify");
     DL_LOAD_SYM(pAclrtGetNotifyId, aclrtGetNotifyIdFunc, rtHandle, "aclrtGetNotifyId");
     DL_LOAD_SYM(pAclrtDestroyNotify, aclrtDestroyNotifyFunc, rtHandle, "aclrtDestroyNotify");
@@ -245,6 +249,8 @@ void DlAclApi::CleanupLibrary()
     pRtDisableP2P = nullptr;
     pRtGetP2PStatus = nullptr;
     pAclrtStreamGetId = nullptr;
+    pRtStreamGetSqid = nullptr;
+    pRtStreamGetCqid = nullptr;
     pAclrtCreateNotify = nullptr;
     pAclrtGetNotifyId = nullptr;
     pAclrtDestroyNotify = nullptr;

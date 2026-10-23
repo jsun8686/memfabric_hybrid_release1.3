@@ -561,6 +561,12 @@ void JoinableRanksQpManager::TrySetQos()
     qosAttr_.sl = sl;
 }
 
+int JoinableRanksQpManager::CreateQpHandle(uint32_t rankId, void *&qpHandle) noexcept
+{
+    BM_LOG_DEBUG("create normal rc qp, rank: " << rankId_ << " remoteRank: " << rankId);
+    return qpCreator_.Create(rdmaHandle_, 0, QP_MODE, qpHandle);
+}
+
 void JoinableRanksQpManager::MakeQpConnections(const std::set<uint32_t> &newRanks) noexcept
 {
     if (newRanks.empty()) {
@@ -579,7 +585,7 @@ void JoinableRanksQpManager::MakeQpConnections(const std::set<uint32_t> &newRank
             auto info = new (std::nothrow) UserQpInfo;
             BM_ASSERT_RET_VOID(info != nullptr, "info is nullptr");
             TP_TRACE_BEGIN(TP_HYBM_RA_QP_CREATE);
-            auto ret = qpCreator_.Create(rdmaHandle_, 0, QP_MODE, qpHandle);
+            auto ret = CreateQpHandle(rankId, qpHandle);
             TP_TRACE_END(TP_HYBM_RA_QP_CREATE, ret);
             if (ret != 0) {
                 BM_LOG_ERROR("create QP to " << rankId << " failed: " << ret);

@@ -147,6 +147,61 @@ Result LoadDeviceKernelAndValidate(const char *funcRead, const char *funcWrite, 
     return BM_OK;
 }
 
+Result LoadDeviceKernelAndGetHandles(aclrtBinHandle &binHandle, aclrtFuncHandle &funcHandle, const char *funcName)
+{
+    if (funcName == nullptr) {
+        BM_LOG_ERROR("AICPU kernel funcName is null");
+        return BM_INVALID_PARAM;
+    }
+    std::string jsonPath;
+    auto ret = GetKernelFilePath(jsonPath);
+    if (ret != BM_OK) {
+        return ret;
+    }
+    if (binHandle == nullptr) {
+        ret = LoadBinaryFromJson(jsonPath.c_str(), binHandle);
+        if (ret != BM_OK) {
+            return ret;
+        }
+    }
+    ret = GetFuncHandle(binHandle, funcName, funcHandle);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("load AICPU kernel failed, func: " << funcName << " ret: " << ret);
+        return ret;
+    }
+    BM_LOG_INFO("AICPU kernel loaded, func: " << funcName << " handle: " << funcHandle);
+    return BM_OK;
+}
+
+Result LaunchAicpuKernel(aclrtFuncHandle funcHandle, void *stream, const void *args, size_t argsBytes)
+{
+    if (funcHandle == nullptr || stream == nullptr) {
+        return BM_INVALID_PARAM;
+    }
+    aclrtArgsHandle argsHandle = nullptr;
+    auto ret = DlAclApi::AclrtKernelArgsInit(funcHandle, &argsHandle);
+    if (ret != BM_OK) {
+        return ret;
+    }
+    aclrtParamHandle paramHandle = nullptr;
+    ret = DlAclApi::AclrtKernelArgsAppend(argsHandle, const_cast<void *>(args), argsBytes, &paramHandle);
+    if (ret != BM_OK) {
+        return ret;
+    }
+    ret = DlAclApi::AclrtKernelArgsFinalize(argsHandle);
+    if (ret != BM_OK) {
+        return ret;
+    }
+    constexpr uint16_t aicpuKernelTimeoutSec = static_cast<uint16_t>(27U * 68U);
+    aclrtLaunchKernelAttr attr{};
+    attr.id = aclrtLaunchKernelAttrId::ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
+    attr.value.timeout = aicpuKernelTimeoutSec;
+    aclrtLaunchKernelCfg cfg{};
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    return DlAclApi::AclrtLaunchKernelWithConfig(funcHandle, 1U, stream, &cfg, argsHandle, nullptr);
+}
+
 } // namespace device
 } // namespace transport
 } // namespace mf
