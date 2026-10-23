@@ -74,9 +74,6 @@ def _manage_kernel(args: argparse.Namespace) -> int:
     soc_key = None
     if args.command == "install":
         soc_key = args.soc_version or _get_soc_key()
-        if soc_key == "A3":
-            LOGGER.info("SoC A3 has no AICPU kernel support, skip kernel ops install.")
-            return _install_acc_offload(soc_key)
 
     command = [bash, str(installer), f"--{args.command}"]
     if args.command == "install" and args.install_for_all:
