@@ -615,10 +615,15 @@ Result DataOpDeviceURMA::BatchDataCopyLocalBatch(hybm_batch_copy_params &params,
         sizes[i] = params.dataSizes[i];
     }
     size_t fail_idx = 0;
-    auto ret = DlAclApi::AclrtMemcpyBatch(params.destinations, sizes.data(), params.sources, sizes.data(), sizes.size(),
-                                          attrs.data(), attrsIds.data(), attrs.size(), &fail_idx);
+    TP_TRACE_BEGIN(TP_HYBM_URMA_BATCH_DATA_COPY_LOCAL_ASYNC);
+    auto ret = BatchDataCopyLocalAsync(params, direction, options);
+    TP_TRACE_END(TP_HYBM_URMA_BATCH_DATA_COPY_LOCAL_ASYNC, ret);
+
     if (ret != 0) {
-        return BatchDataCopyLocalAsync(params, direction, options);
+        TP_TRACE_BEGIN(TP_HYBM_URMA_ACLRT_MEMCPY_BATCH);
+        ret = DlAclApi::AclrtMemcpyBatch(params.destinations, sizes.data(), params.sources, sizes.data(), sizes.size(),
+                                         attrs.data(), attrsIds.data(), attrs.size(), &fail_idx);
+        TP_TRACE_END(TP_HYBM_URMA_ACLRT_MEMCPY_BATCH, ret);
     }
     return ret;
 }
