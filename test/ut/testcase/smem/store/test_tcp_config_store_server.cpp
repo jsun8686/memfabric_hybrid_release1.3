@@ -13,7 +13,9 @@
 #include <gtest/gtest.h>
 
 #include <functional>
+#include <future>
 #include <sstream>
+#include <thread>
 
 #define private public // Test access to heartbeat timeout parsing.
 #include "smem_tcp_config_store_server.h"
@@ -21,6 +23,7 @@
 #include "smem_local_memory_backend.h"
 #include "smem_cluster_status.h"
 #include "smem_config_store_api.h"
+#include "mf_str_util.h"
 
 namespace ock {
 namespace smem {
@@ -212,6 +215,57 @@ TEST_F(AccStoreServerTest, HeartbeatTimeoutMissingOrInvalidUsesDefault)
     EXPECT_EQ(AccStoreServer::ParseHeartbeatTimeoutS("-1"), K_DEFAULT_HEARTBEAT_TIMEOUT_S);
     EXPECT_EQ(AccStoreServer::ParseHeartbeatTimeoutS("abc"), K_DEFAULT_HEARTBEAT_TIMEOUT_S);
     EXPECT_EQ(AccStoreServer::ParseHeartbeatTimeoutS("3601"), K_DEFAULT_HEARTBEAT_TIMEOUT_S);
+}
+
+TEST_F(AccStoreServerTest, HeartbeatCheckerRemovesExpiredLinkAndKeepsLiveLink)
+{
+    const auto now = mf::StrUtil::GetNowTime();
+    server_->heartBeatTimeoutS_ = K_DEFAULT_HEARTBEAT_TIMEOUT_S;
+    const auto timeout = std::chrono::seconds(K_DEFAULT_HEARTBEAT_TIMEOUT_S);
+    server_->heartBeatMap_[0] = now - std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
+    server_->heartBeatMap_[1] = now;
+    server_->linkRankMap_[0] = 0;
+    server_->linkRankMap_[1] = 1;
+    server_->aliveRankSet_ = {0, 1};
+    server_->state_.store(SS_NORMAL);
+
+    std::promise<uint32_t> expiredLink;
+    auto result = expiredLink.get_future();
+    server_->RegisterBrokenLinkCHandler(
+        [&expiredLink](uint32_t linkId, StoreBackendPtr &) { expiredLink.set_value(linkId); });
+    std::thread checker([this]() { server_->CheckerThreadTask(); });
+    const auto status = result.wait_for(std::chrono::seconds(2));
+    server_->state_.store(SS_EXITED);
+    server_->storeCond_.notify_all();
+    checker.join();
+    server_->RegisterBrokenLinkCHandler(nullptr);
+
+    ASSERT_EQ(status, std::future_status::ready);
+    EXPECT_EQ(result.get(), 0U);
+    EXPECT_EQ(server_->heartBeatMap_.count(0), 0U);
+    EXPECT_EQ(server_->heartBeatMap_.count(1), 1U);
+    EXPECT_EQ(server_->aliveRankSet_.count(0), 0U);
+    EXPECT_EQ(server_->aliveRankSet_.count(1), 1U);
+}
+
+TEST_F(AccStoreServerTest, HeartbeatSnapshotReportsElapsedMilliseconds)
+{
+    constexpr int64_t kOlderMs = 1250;
+    constexpr int64_t kNewerMs = 40;
+    const auto now = mf::StrUtil::GetNowTime();
+    server_->heartBeatMap_[0] = now - kOlderMs;
+    server_->heartBeatMap_[1] = now - kNewerMs;
+    server_->linkRankMap_[0] = 0;
+    server_->linkRankMap_[1] = 1;
+
+    const auto snapshot = server_->CaptureClusterStatus();
+    const auto elapsedMs = mf::StrUtil::GetNowTime() - now;
+    ASSERT_EQ(snapshot.heartbeats.size(), 2U);
+    EXPECT_EQ(snapshot.heartbeats[0].first, 0U);
+    EXPECT_EQ(snapshot.heartbeats[1].first, 1U);
+    EXPECT_GE(snapshot.heartbeats[0].second, kOlderMs);
+    EXPECT_LE(snapshot.heartbeats[0].second, kOlderMs + elapsedMs);
+    EXPECT_EQ(snapshot.heartbeats[0].second - snapshot.heartbeats[1].second, kOlderMs - kNewerMs);
 }
 
 TEST_F(AccStoreServerTest, LinkRetryTimeoutParsesSecondsWithinRange)

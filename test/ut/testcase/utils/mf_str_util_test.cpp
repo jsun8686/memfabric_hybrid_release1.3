@@ -287,3 +287,17 @@ TEST_F(MFStrUtilTest, GetNowTime_Increases)
     auto t2 = StrUtil::GetNowTime();
     EXPECT_GE(t2, t1);
 }
+
+TEST_F(MFStrUtilTest, GetNowTime_UsesMonotonicMilliseconds)
+{
+    const auto before =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    const auto value = StrUtil::GetNowTime();
+    const auto after =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+
+    EXPECT_GE(value, before);
+    EXPECT_LE(value, after);
+}
