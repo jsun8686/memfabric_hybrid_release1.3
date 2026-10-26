@@ -19,7 +19,7 @@ permissions:
 jobs:
   release:
     name: Generate notes and create Release
-    runs-on: [self-hosted, x86, cpu=16]
+    runs-on: [self-hosted, default, x86, cpu=16]
     container:
       image: swr.cn-north-4.myhuaweicloud.com/memfabric-hybrid/memfabric-hybrid_x86:multi_python_v2
     steps:
