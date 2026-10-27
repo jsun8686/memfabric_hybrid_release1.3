@@ -716,7 +716,8 @@ Result DeviceUrmaTransportManager::OpenEndpointResourcesLocked(const TransportOp
     BM_LOG_INFO("device_urma OpenDevice protocol=" << protocol_ << ", rankId=" << rankId_ << ", phyDeviceId="
                                                    << phyDeviceId_ << ", mainboardId=" << mainboardId_);
     static const bool fullMesh = MfEnvUtil::GetOptionalUintOrDefault(env::TEST_MF_TRANSPORT_FULL_MESH, 0u) != 0u;
-    if (fullMesh || IsFM16Product()) {
+    const bool useMultiEndpoints = (fullMesh || IsFM16Product()) && protocol_ == UrmaProtocol::UBC_CTP;
+    if (useMultiEndpoints) {
         std::vector<UrmaEndpointDesc> localDescs;
         auto ret = BuildLocalEndpointsDescLocked(protocol_, localDescs);
         if (ret != BM_OK) {
