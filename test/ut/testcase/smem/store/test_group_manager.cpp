@@ -510,6 +510,36 @@ TEST_F(GmGroupManagerTest, PromoteCheckedInRanks_AllIdleLinksPromotesToActive)
     EXPECT_EQ(GetRank(1), RANK_CHECKED_IN);
 }
 
+TEST_F(GmGroupManagerTest, PromoteCheckedInRanks_WaitsForActivePeerReverseLink)
+{
+    constexpr uint32_t kActiveRank = 0U;
+    constexpr uint32_t kJoiningRank = 1U;
+    std::vector<RankState> states(K_RANK_COUNT, RANK_IDLE);
+    states[kActiveRank] = RANK_ACTIVE;
+    states[kJoiningRank] = RANK_CHECKED_IN;
+    std::vector<LinkState> links(K_RANK_COUNT * K_RANK_COUNT, LINK_IDLE);
+    links[kJoiningRank * K_RANK_COUNT + kActiveRank] = LINK_CONNECTED;
+    links[kActiveRank * K_RANK_COUNT + kJoiningRank] = LINK_CONNECTING;
+    std::unordered_set<uint32_t> alive{kActiveRank, kJoiningRank};
+    gm_->RestoreState(states, links, alive);
+    gm_->RebuildActiveLinks();
+
+    gm_->Start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(K_WAIT_MS));
+    gm_->Stop();
+    EXPECT_EQ(GetRank(kActiveRank), RANK_ACTIVE);
+    EXPECT_EQ(GetRank(kJoiningRank), RANK_CHECKED_IN);
+    EXPECT_EQ(GetLink(kActiveRank, kJoiningRank), LINK_CONNECTING);
+
+    gm_->OnControlAck(CONTROL_ESTABLISH_CONNECTION_ACK, kActiveRank, std::map<uint32_t, int32_t>{{kJoiningRank, 0}});
+    ASSERT_EQ(GetLink(kActiveRank, kJoiningRank), LINK_CONNECTED);
+    gm_->Start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(K_WAIT_MS));
+    gm_->Stop();
+    EXPECT_EQ(GetRank(kActiveRank), RANK_ACTIVE);
+    EXPECT_EQ(GetRank(kJoiningRank), RANK_ACTIVE);
+}
+
 TEST_F(GmGroupManagerTest, PromoteCheckedInRanks_AllPeersConnectedPromotesToActive)
 {
     ASSERT_EQ(gm_->CheckIn(MakeInfo(0)), 0);

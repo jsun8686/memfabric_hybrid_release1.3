@@ -475,8 +475,8 @@ void SmemGroupManagerServer::ScanLinkStates(LinkScanContext &ctx, LinkState st, 
 }
 
 /*
- * Promote CHECKED_IN ranks to ACTIVE once all their links reach stable states
- * and at least half of the peer links are CONNECTED.
+ * Promote CHECKED_IN ranks to ACTIVE once their links are stable and both directions
+ * to every joined, non-pruned peer are CONNECTED.
  * Populates promotedToActive for caller to persist state changes.
  */
 void SmemGroupManagerServer::PromoteCheckedInRanks(std::vector<uint32_t> &promotedToActive) noexcept
@@ -526,7 +526,7 @@ bool SmemGroupManagerServer::HasEnoughConnectedLinks(uint32_t r) noexcept
             continue;
         }
         peers++;
-        if (links_[LinkIndex(r, j)] == LINK_CONNECTED) {
+        if (links_[LinkIndex(r, j)] == LINK_CONNECTED && links_[LinkIndex(j, r)] == LINK_CONNECTED) {
             connected++;
         }
     }
