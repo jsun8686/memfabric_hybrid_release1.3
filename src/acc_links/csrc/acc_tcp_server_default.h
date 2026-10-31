@@ -42,6 +42,8 @@ public:
     void RegisterNewLinkHandler(const AccNewLinkHandler &h) override;
     void RegisterDecryptHandler(const AccDecryptHandler &h) override;
 
+    uint64_t GetWorkerUnobservableMs(uint32_t workerIdx) const override;
+
     virtual Result HandleRequestSent(AccMsgSentResult msgResult, const AccMsgHeader &header,
                                      const AccDataBufferPtr &cbCtx);
     virtual Result HandleLinkBroken(const AccTcpLinkDefaultPtr &link);
@@ -62,6 +64,9 @@ protected:
     AccLinkBrokenHandler linkBrokenHandle_ = nullptr;
     AccDecryptHandler decryptHandler_ = nullptr;
     std::vector<AccTcpWorkerPtr> workers_;
+    /* 叶子锁，仅用于同步"查询不可观测时长"读 workers_ 与停止清理时 clear 的摘除动作；
+       与 mutex_ 无嵌套关系，避免把 acc 回调路径上的长持锁牵连进心跳查询 */
+    mutable std::mutex workersMutex_;
     AccTcpListenerPtr listener_;
     std::atomic<uint32_t> nextWorkerIndex_{0};
     std::unordered_map<uint32_t, AccTcpLinkDefaultPtr> connectedLinks_;

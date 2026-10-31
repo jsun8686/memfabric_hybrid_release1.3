@@ -218,6 +218,16 @@ public:
     virtual int32_t EnqueueAndModifyEpoll(const AccMsgHeader &h, const AccDataBufferPtr &d,
                                           const AccDataBufferPtr &cbCtx) = 0;
 
+    /**
+     * @brief Get the index of the worker this link is bound to
+     *
+     * @return worker index, 0 if the implementation does not track it
+     */
+    virtual uint32_t GetWorkerIndex() const
+    {
+        return 0;
+    }
+
 protected:
     AccTcpLinkComplex(int fd, const std::string &ipPort, uint32_t id) : AccTcpLink(fd, ipPort, id) {}
 };

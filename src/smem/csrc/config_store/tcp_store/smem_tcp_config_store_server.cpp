@@ -13,11 +13,13 @@
 
 #include <pthread.h>
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <iomanip>
 #include <sstream>
 #include <map>
 #include <cstring>
+#include <thread>
 #include <utility>
 #include "acc_tcp_server.h"
 #include "smem_config_store_logger.h"
@@ -373,7 +375,10 @@ Result AccStoreServer::LinkConnectedHandler(const ock::acc::AccConnReq &req,
     aliveRankSet_.insert(rankId);
     rankLinks_[rankId] = link;
     reconnectedRankSet_.insert(rankId);
-    linkRankMap_[link->Id()] = rankId;
+    {
+        std::lock_guard<std::mutex> rankGuard{linkRankMutex_};
+        linkRankMap_[link->Id()] = rankId;
+    }
     if (groupManager_ != nullptr && req.reconnect == 1) {
         groupManager_->MarkRankReconnected(rankId);
     }
@@ -390,30 +395,95 @@ Result AccStoreServer::LinkConnectedHandler(const ock::acc::AccConnReq &req,
 
 Result AccStoreServer::LinkBrokenHandler(const ock::acc::AccTcpLinkComplexPtr &link) noexcept
 {
-    return LinkBrokenHandler(link->Id());
+    /* ReleaseLink 复用 acc 标准断链路径回调本函数，回调不携带断链原因，用 CheckerThreadTask
+       预置的标记还原为 HEARTBEAT_TIMEOUT。但两条路径（巡检线程的 ReleaseLink 与 acc worker
+       线程上报的真实 TCP 断链）复用同一回调：若标记预置后链路又发生真实断链，残留标记会把
+       真实断链误判为心跳超时，从而跳过 KEY_ALIVE_RANK_LIST 删除（该删不删）。故仅在回调确实
+       发生在巡检线程上时才信任该标记，否则按真实原因 TCP_BROKEN 处理。 */
+    BrokenReason reason = BrokenReason::TCP_BROKEN;
+    {
+        std::lock_guard<std::mutex> guard{storeMutex_};
+        if (heartbeatTimeoutLinkIds_.find(link->Id()) != heartbeatTimeoutLinkIds_.end() &&
+            std::this_thread::get_id() == checkerThreadId_) {
+            reason = BrokenReason::HEARTBEAT_TIMEOUT;
+        }
+    }
+    return LinkBrokenHandler(link->Id(), reason);
 }
 
-Result AccStoreServer::LinkBrokenHandler(const uint32_t linkId) noexcept
+Result AccStoreServer::LinkBrokenHandler(const uint32_t linkId, BrokenReason reason) noexcept
 {
-    STORE_LOG_DEBUG("link broken, linkId: " << linkId);
+    const char *reasonStr = (reason == BrokenReason::TCP_BROKEN) ? "tcp_broken" : "heartbeat_timeout";
+    STORE_LOG_DEBUG("link broken, linkId: " << linkId << ", reason: " << reasonStr);
+    /* 上层注册的断链回调（memcache 侧 ClearResource → RemoveBlobs）在百万级元数据下为全表
+       扫描，单次可达秒级，必须放在 storeMutex_ 之外调用，否则长持锁会阻塞心跳写入与巡检。
+       回调受 storeMutex_ 保护（RegisterBrokenLinkCHandler 亦持锁写入），故先在锁内拷出副本，
+       避免换届重注册与本次调用并发读写同一 std::function。 */
+    ConfigStoreServerBrokenHandler brokenHandler = nullptr;
+    {
+        std::lock_guard<std::mutex> handlerGuard{storeMutex_};
+        brokenHandler = externalBrokenHandler_;
+    }
+    if (brokenHandler != nullptr) {
+        /* 被调体（memcache 侧 ClearResource → RemoveBlobs）在百万级元数据下为全表扫描且不保证可重入，
+           而本回调会被多个 acc worker 线程并发回调（不同 rank 同时断链即多线程同时进入本函数）。
+           修复前它在 storeMutex_ 临界区内调用、被全局串行化；挪到锁外后必须由
+           externalBrokenCallbackMutex_ 单独串行化，且不得复用 storeMutex_，否则又变成断链清理
+           全程持 store 锁——正是本次要消除的长持锁问题。 */
+        std::lock_guard<std::mutex> brokenHandlerGuard{externalBrokenCallbackMutex_};
+        brokenHandler(linkId, backend_);
+    }
+
     uint32_t rankId = std::numeric_limits<uint32_t>::max();
     std::unique_lock<std::mutex> lockGuard{storeMutex_};
-    if (externalBrokenHandler_ != nullptr) {
-        externalBrokenHandler_(linkId, backend_);
+    heartbeatTimeoutLinkIds_.erase(linkId);
+    bool rankFound = false;
+    {
+        std::lock_guard<std::mutex> rankGuard{linkRankMutex_};
+        auto it = linkRankMap_.find(linkId);
+        if (it != linkRankMap_.end()) {
+            rankId = it->second;
+            linkRankMap_.erase(it);
+            rankFound = true;
+        }
     }
-    auto it = linkRankMap_.find(linkId);
-    if (it != linkRankMap_.end()) {
-        rankId = it->second;
-        linkRankMap_.erase(it);
+    if (rankFound) {
         aliveRankSet_.erase(rankId);
         reconnectedRankSet_.erase(rankId);
         rankLinks_.erase(rankId);
-        PersistAliveRankIds(aliveRankSet_);
-        STORE_LOG_TRACE("link broken, linkId: " << linkId << " remove rankId: " << rankId);
     }
-    heartBeatMap_.erase(linkId);
+    /* 删除判据：不看本次断链原因，而看"删下去会丢什么"——持久化名单中是否还有既不在当前存活集、
+       也不等于本次刚确认退出 rank 的项，即被心跳超时摘除后保留、尚待恢复的 rank。心跳超时摘除不
+       写回名单，故名单可能比存活集多出这些项；KEY_ALIVE_RANK_LIST 是下一任 leader 恢复存活名单的
+       唯一来源，误删不可逆，因此只要存在保留项，下面的同步持久化与全断删除两条路径都不得抹掉它。
+       rankFound 为假时本链路无 rank 可摘，沿用最大 rankId 作占位，不排除任何项。 */
+    const bool hasRetainedRanks = HasPersistedRanksOutside(aliveRankSet_, rankId);
+    if (rankFound) {
+        /* 心跳超时仅表示本窗口内未观测到心跳：既可能是本进程 acc worker 被长耗时回调占满/被冻结
+           导致观测本身失效，也可能是对端确实停止上报（观测正常但无心跳到达），二者无法从超时本身
+           区分，故不足以断定 rank 真实退出，不允许同步持久化（PersistAliveRankIds 在集合清空时
+           会 Delete(KEY_ALIVE_RANK_LIST)，误删不可逆）。 */
+        if (reason == BrokenReason::TCP_BROKEN && !hasRetainedRanks) {
+            PersistAliveRankIds(aliveRankSet_);
+        } else if (reason == BrokenReason::TCP_BROKEN) {
+            STORE_LOG_WARN("skip persisting " << KEY_ALIVE_RANK_LIST << " on tcp broken, linkId: " << linkId
+                                              << ", rankId: " << rankId
+                                              << ", persisted alive ranks still hold ranks pending recovery");
+        }
+        /* 心跳超时摘除 rank 是本进程观测失效与对端真实退出的共同结果，无法从超时本身区分，
+           发生频率低但影响不可逆，故升为 INFO 以便故障回溯；真实断链属正常事件，保持 DEBUG。 */
+        if (reason == BrokenReason::HEARTBEAT_TIMEOUT) {
+            STORE_LOG_INFO("link broken by heartbeat timeout, linkId: " << linkId << " remove rankId: " << rankId);
+        } else {
+            STORE_LOG_DEBUG("link broken, linkId: " << linkId << " remove rankId: " << rankId);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> heartBeatGuard{heartBeatMutex_};
+        heartBeatMap_.erase(linkId);
+    }
     if (aliveRankSet_.empty()) {
-        STORE_LOG_TRACE("all client link broken, will clear data");
+        STORE_LOG_WARN("all client link broken, will clear data, reason: " << reasonStr);
         rankIndex_ = 0;
         backend_->Clear();
         waitCtx_.clear();
@@ -423,8 +493,19 @@ Result AccStoreServer::LinkBrokenHandler(const uint32_t linkId) noexcept
         linkWatchList_.clear();
         watchWaiters_.clear();
         rankStateTaskQueue_ = {};
-        linkRankMap_.clear();
-        (void)backend_->Delete(KEY_ALIVE_RANK_LIST);
+        {
+            std::lock_guard<std::mutex> rankGuard{linkRankMutex_};
+            linkRankMap_.clear();
+        }
+        /* 与上面共用同一判据：集群虽已全断，但名单里若还留着待恢复的 rank（如前面几条链路是心跳
+           超时摘除、最后一条恰为真实断链），整份删除同样不可逆，故一并拦住。 */
+        if (reason == BrokenReason::TCP_BROKEN && !hasRetainedRanks) {
+            (void)backend_->Delete(KEY_ALIVE_RANK_LIST);
+        } else {
+            STORE_LOG_WARN("skip deleting " << KEY_ALIVE_RANK_LIST << ", linkId: " << linkId
+                                            << ", reason: " << reasonStr
+                                            << ", persisted alive ranks still hold ranks pending recovery");
+        }
     }
     rankStateWaiters_.erase(linkId);
     for (auto &key : linkWatchList_[linkId]) {
@@ -590,13 +671,19 @@ uint32_t AccStoreServer::FindFreeRankIndex(const ock::acc::AccTcpRequestContext 
         if (aliveRankSet_.find(rankIndex_) == aliveRankSet_.end()) {
             aliveRankSet_.insert(rankIndex_);
             reconnectedRankSet_.insert(rankIndex_);
-            linkRankMap_[linkId] = rankIndex_;
+            {
+                std::lock_guard<std::mutex> rankGuard{linkRankMutex_};
+                linkRankMap_[linkId] = rankIndex_;
+            }
             rankLinks_[rankIndex_] = context.Link();
             STORE_LOG_INFO("AllocAndReply prePersist idx=" << rankIndex_ << " alive=" << aliveRankSet_.size());
             if (PersistAliveRankIds(aliveRankSet_) != SUCCESS) {
                 aliveRankSet_.erase(rankIndex_);
                 reconnectedRankSet_.erase(rankIndex_);
-                linkRankMap_.erase(linkId);
+                {
+                    std::lock_guard<std::mutex> rankGuard{linkRankMutex_};
+                    linkRankMap_.erase(linkId);
+                }
                 STORE_LOG_ERROR("persist alive rank failed");
                 return UINT32_MAX;
             }
@@ -1120,9 +1207,54 @@ Result AccStoreServer::HeartbeatHandler(const ock::acc::AccTcpRequestContext &co
     }
     STORE_ASSERT_RETURN(context.Link() != nullptr, SM_INVALID_PARAM);
     uint32_t linkId = context.Link()->Id();
-    std::unique_lock<std::mutex> lockGuard{storeMutex_};
-    heartBeatMap_[linkId] = mf::StrUtil::GetNowTime();
+    HeartbeatRecord record;
+    record.stampMs = NowMonotonicMs();
+    record.workerIdx = context.Link()->GetWorkerIndex();
+    std::lock_guard<std::mutex> heartBeatGuard{heartBeatMutex_};
+    /* 此处只加 heartBeatMutex_、不加 storeMutex_：本函数仅在 acc worker 线程内被回调，
+       而 Shutdown 置空 accTcpServer_ 之前先调用 accTcpServer_->Stop() 并 join 全部 worker
+       线程，故本线程读到的一定是存活对象，无需再取 storeMutex_（否则会给心跳热路径引入长持锁）。 */
+    if (accTcpServer_ != nullptr) {
+        record.unobsMs = accTcpServer_->GetWorkerUnobservableMs(record.workerIdx);
+    }
+    heartBeatMap_[linkId] = record;
     return SM_OK;
+}
+
+int64_t AccStoreServer::NowMonotonicMs() noexcept
+{
+    return static_cast<int64_t>(mf::MonotonicTime::TimeUs() / 1000ULL);
+}
+
+uint64_t AccStoreServer::ClampUnobservableDeltaMs(uint64_t prevUnobsMs, uint64_t curUnobsMs,
+                                                  int64_t rawElapsedMs) noexcept
+{
+    /* 静默时长非正（时刻未前进）时无可扣除窗口 */
+    if (rawElapsedMs <= 0 || curUnobsMs <= prevUnobsMs) {
+        return 0;
+    }
+    const uint64_t deltaMs = curUnobsMs - prevUnobsMs;
+    const uint64_t capMs = static_cast<uint64_t>(rawElapsedMs);
+    /* 快照差可能大于静默时长（worker 长时间饥饿），按静默时长封顶 */
+    return deltaMs > capMs ? capMs : deltaMs;
+}
+
+uint64_t AccStoreServer::UnobservableDeltaMs(const HeartbeatRecord &record, int64_t rawElapsedMs,
+                                             const ock::acc::AccTcpServerPtr &accServer) noexcept
+{
+    if (accServer == nullptr) {
+        return 0;
+    }
+    return ClampUnobservableDeltaMs(record.unobsMs, accServer->GetWorkerUnobservableMs(record.workerIdx), rawElapsedMs);
+}
+
+bool AccStoreServer::IsHeartbeatExpired(int64_t rawElapsedMs, uint64_t unobservableMs, int64_t timeoutMs) noexcept
+{
+    if (timeoutMs <= 0) { /* 0 表示关闭心跳巡检 */
+        return false;
+    }
+    const int64_t effectiveElapsedMs = rawElapsedMs - static_cast<int64_t>(unobservableMs);
+    return effectiveElapsedMs >= timeoutMs;
 }
 
 std::list<ock::acc::AccTcpRequestContext>
@@ -1295,31 +1427,85 @@ uint32_t AccStoreServer::ParseLinkRetryTimeoutS(const std::string &value) noexce
 void AccStoreServer::CheckerThreadTask() noexcept
 {
     pthread_setname_np(pthread_self(), "store_chk_sts");
-    const auto timeout = std::chrono::seconds(heartBeatTimeoutS_);
+    {
+        // 记录本线程身份：ReleaseLink 触发的 LinkBrokenHandler(link) 在巡检线程上同步执行，
+        // 据此与 acc worker 线程上报的真实断链区分（见该函数实现）。
+        std::lock_guard<std::mutex> idGuard{storeMutex_};
+        checkerThreadId_ = std::this_thread::get_id();
+    }
     std::unordered_set<uint32_t> brokenLinks;
     // 心跳超时链路的句柄快照：摘除 rank 后仍需主动关闭该 TCP 链路（见下方说明）
     std::vector<ock::acc::AccTcpLinkComplexPtr> expiredLinks;
-    std::unique_lock<std::mutex> lockerGuard{storeMutex_};
     while (state_.load() != SS_EXITED) {
-        auto curTime = mf::StrUtil::GetNowTime();
-        for (auto it = heartBeatMap_.begin(); it != heartBeatMap_.end();) {
-            if (heartBeatTimeoutS_ > 0 && std::chrono::milliseconds(curTime - it->second) >= timeout) {
-                STORE_LOG_TRACE("link(" << it->first << ") heartbeat expired, timeoutS=" << heartBeatTimeoutS_);
-                brokenLinks.insert(it->first);
-                // 在摘除 rank 前先取出链路句柄（linkRankMap_/rankLinks_ 均由 storeMutex_ 保护）
-                auto rankIt = linkRankMap_.find(it->first);
-                if (rankIt != linkRankMap_.end()) {
-                    auto linkIt = rankLinks_.find(rankIt->second);
-                    if (linkIt != rankLinks_.end() && linkIt->second != nullptr) {
-                        expiredLinks.push_back(linkIt->second);
+        const int64_t curTime = NowMonotonicMs();
+        const int64_t timeoutMs = static_cast<int64_t>(heartBeatTimeoutS_) * 1000;
+        /* 锁内取 acc 服务句柄本地副本：Shutdown 在 accTcpServer_->Stop() 之后置空该句柄，而本线程
+           要到 checkerThread_.join() 才退出，裸读会出现与置空竞争的判空后解引用，故统一用副本。 */
+        ock::acc::AccTcpServerPtr accServer = nullptr;
+        {
+            std::lock_guard<std::mutex> accGuard{storeMutex_};
+            accServer = accTcpServer_;
+        }
+        uint32_t exemptedCount = 0;
+        uint64_t exemptedTotalMs = 0;
+        uint32_t worstWorkerIdx = 0;
+        uint64_t worstExemptedMs = 0;
+        {
+            std::lock_guard<std::mutex> heartBeatGuard{heartBeatMutex_};
+            for (auto it = heartBeatMap_.begin(); it != heartBeatMap_.end();) {
+                if (timeoutMs == 0) { /* 巡检关闭，不做超时判定 */
+                    ++it;
+                    continue;
+                }
+                const int64_t rawElapsedMs = curTime - it->second.stampMs;
+                const uint64_t unobsDeltaMs = UnobservableDeltaMs(it->second, rawElapsedMs, accServer);
+                if (IsHeartbeatExpired(rawElapsedMs, unobsDeltaMs, timeoutMs)) {
+                    STORE_LOG_WARN("link("
+                                   << it->first << ") heartbeat expired, rawElapsedMs=" << rawElapsedMs
+                                   << ", effectiveElapsedMs=" << (rawElapsedMs - static_cast<int64_t>(unobsDeltaMs))
+                                   << ", workerIdx=" << it->second.workerIdx << ", timeoutS=" << heartBeatTimeoutS_);
+                    brokenLinks.insert(it->first);
+                    it = heartBeatMap_.erase(it);
+                    continue;
+                }
+                if (rawElapsedMs >= timeoutMs && unobsDeltaMs > 0) {
+                    /* 仅统计"本应超时、因本进程自身不可观测而豁免"的链路：不扣除即会超时
+                       （rawElapsedMs >= timeoutMs）、扣除后才未超时者。rawElapsedMs 本就未达
+                       阈值的健康链路并非被豁免，不得计入 exemptedCount/totalExemptedMs。
+                       逐链路扣除，不放松判定阈值。 */
+                    ++exemptedCount;
+                    exemptedTotalMs += unobsDeltaMs;
+                    if (unobsDeltaMs > worstExemptedMs) {
+                        worstExemptedMs = unobsDeltaMs;
+                        worstWorkerIdx = it->second.workerIdx;
                     }
                 }
-                it = heartBeatMap_.erase(it);
-            } else {
                 ++it;
             }
         }
-        lockerGuard.unlock();
+        if (exemptedCount > 0) {
+            /* 每轮最多一条，天然限频 */
+            STORE_LOG_WARN("heartbeat check exempted "
+                           << exemptedCount << " link(s) that would otherwise time out, totalExemptedMs="
+                           << exemptedTotalMs << ", worstWorkerIdx=" << worstWorkerIdx
+                           << ", worstExemptedMs=" << worstExemptedMs << ", timeoutS=" << heartBeatTimeoutS_);
+        }
+        // 在摘除 rank 前先取出链路句柄（linkRankMap_/rankLinks_ 均由 storeMutex_ 保护），并标记断链原因：
+        // ReleaseLink 的回调 LinkBrokenHandler(link) 不携带原因，故用集合标记让回调还原为 HEARTBEAT_TIMEOUT。
+        {
+            std::lock_guard<std::mutex> metaGuard{storeMutex_};
+            for (auto linkId : brokenLinks) {
+                heartbeatTimeoutLinkIds_.insert(linkId);
+                auto rankIt = linkRankMap_.find(linkId);
+                if (rankIt == linkRankMap_.end()) {
+                    continue;
+                }
+                auto linkIt = rankLinks_.find(rankIt->second);
+                if (linkIt != rankLinks_.end() && linkIt->second != nullptr) {
+                    expiredLinks.push_back(linkIt->second);
+                }
+            }
+        }
         // 心跳超时链路走 acc 的标准断链清理：Break -> 回调本类 LinkBrokenHandler（rank 簿记 + meta 侧
         // 资源回收）-> RemoveLink / delayCleanup / connectedLinks_ 摘除，最后关闭 fd 触发对端重连。
         // 不能只调 link->Close()：Close() 会把 established_ 置 0、并让 RemoveLink 因 fd_ == -1 提前返回，
@@ -1330,10 +1516,10 @@ void AccStoreServer::CheckerThreadTask() noexcept
                 continue;
             }
             STORE_LOG_WARN("link(" << link->Id() << ") heartbeat timeout, release link to trigger peer reconnect");
-            if (accTcpServer_ != nullptr) {
+            if (accServer != nullptr) {
                 // 仅当 acc 真正完成了标准断链清理（上层 LinkBrokenHandler 已被回调）时才跳过下面的本地簿记；
                 // 链路已不在 acc 管辖范围（例如已被 worker 断链路径清理）时会返回错误，由下面循环兜底。
-                if (accTcpServer_->ReleaseLink(link) == ock::acc::ACC_OK) {
+                if (accServer->ReleaseLink(link) == ock::acc::ACC_OK) {
                     releasedLinkIds.insert(link->Id());
                 }
             } else {
@@ -1346,11 +1532,11 @@ void AccStoreServer::CheckerThreadTask() noexcept
             if (releasedLinkIds.find(linkId) != releasedLinkIds.end()) {
                 continue; // 已在 ReleaseLink 回调的 LinkBrokenHandler 中完成
             }
-            LinkBrokenHandler(linkId); // private func, locks storeMutex_ internally
+            LinkBrokenHandler(linkId, BrokenReason::HEARTBEAT_TIMEOUT); // private func, locks storeMutex_ internally
         }
         expiredLinks.clear();
-        lockerGuard.lock();
         brokenLinks.clear();
+        std::unique_lock<std::mutex> lockerGuard{storeMutex_};
         storeCond_.wait_for(lockerGuard, std::chrono::milliseconds(HEARTBEAT_INTERVAL),
                             [this]() { return (state_.load() == SS_EXITED); });
     }
@@ -1375,8 +1561,18 @@ Result AccStoreServer::RestoreFromBackend() noexcept
         won't re-assign ranks already in use.  Do NOT seed reconnectedRankSet_ — it must only be populated by
         LinkConnectedHandler so QueryAlive accurately reflects which ranks actually have an active TCP connection.
     */
-    for (auto rk : aliveRankFromBackend_) {
-        aliveRankSet_.insert(rk);
+    {
+        /* aliveRankSet_ / persistedAliveRanks_ 均声明由 storeMutex_ 保护：LinkBrokenHandler 会在 acc worker
+           线程上持该锁遍历前者，HasPersistedRanksOutside 会遍历后者。换届恢复窗口内 acc 链路仍可能断链
+           （LinkBrokenHandler 与 RestoreFromBackend 并发），无锁赋值（可能触发容器 rehash/释放节点）撞上
+           持锁遍历属未定义行为，故本处两处写入都必须持 storeMutex_（调用方不持该锁，无需嵌套）。 */
+        std::lock_guard<std::mutex> guard{storeMutex_};
+        for (auto rk : aliveRankFromBackend_) {
+            aliveRankSet_.insert(rk);
+        }
+        /* 同步镜像：此刻后端内容就是恢复出来的这份名单，镜像必须与之一致，否则换届后
+           HasPersistedRanksOutside 会因镜像为空而恒返回假，存活名单保护静默失效。 */
+        persistedAliveRanks_ = aliveRankFromBackend_;
     }
 
     return SM_OK;
@@ -1450,7 +1646,11 @@ Result AccStoreServer::UpdateStatus(bool status) noexcept
 
 uint32_t AccStoreServer::GetRankIdByLinkId(uint32_t linkId) const noexcept
 {
-    // 注意：调用者必须已持有 storeMutex_（CheckerThreadTask / LinkBrokenHandler 均已持锁）
+    /* linkRankMap_ 由 linkRankMutex_ 自保护：上层注册的断链回调会经本函数读表，而该回调
+       在 storeMutex_ 之外执行（见 LinkBrokenHandler(linkId, reason)），不能依赖 storeMutex_。
+       若调用方已持 storeMutex_（如 CheckerThreadTask / CaptureClusterStatus），锁序为
+       storeMutex_ → linkRankMutex_，本函数不反向获取，无死锁风险。 */
+    std::lock_guard<std::mutex> rankGuard{linkRankMutex_};
     auto it = linkRankMap_.find(linkId);
     return it != linkRankMap_.end() ? it->second : UINT32_MAX;
 }
@@ -1476,6 +1676,8 @@ StoreErrorCode AccStoreServer::PersistAliveRankIds(const std::unordered_set<uint
     STORE_LOG_INFO("PersistRanks n=" << ranks.size()
                                      << " dist=" << (backend_ != nullptr ? backend_->IsDistributed() : 0));
     if (!backend_->IsDistributed()) {
+        /* 非分布式无落盘，但仍维护镜像，使"后端名单内容"的语义在两种后端下一致 */
+        persistedAliveRanks_ = ranks;
         return SUCCESS;
     }
     if (ranks.empty()) {
@@ -1484,6 +1686,7 @@ StoreErrorCode AccStoreServer::PersistAliveRankIds(const std::unordered_set<uint
             STORE_LOG_ERROR("Failed to remove alive ranks key from backend");
             return ret;
         }
+        persistedAliveRanks_.clear();
         STORE_LOG_TRACE("Alive ranks cleared in backend");
         return SUCCESS;
     }
@@ -1504,9 +1707,21 @@ StoreErrorCode AccStoreServer::PersistAliveRankIds(const std::unordered_set<uint
     if (ret != SUCCESS) {
         STORE_LOG_ERROR("Failed to persist alive ranks, count: " << ranks.size() << ", ranks: " << str);
     } else {
+        persistedAliveRanks_ = ranks;
         STORE_LOG_TRACE("Alive ranks persisted, count: " << ranks.size() << ", ranks: " << str);
     }
     return ret;
+}
+
+bool AccStoreServer::HasPersistedRanksOutside(const std::unordered_set<uint32_t> &aliveRanks,
+                                              uint32_t excludeRank) const noexcept
+{
+    for (uint32_t rank : persistedAliveRanks_) {
+        if (rank != excludeRank && aliveRanks.find(rank) == aliveRanks.end()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 StoreErrorCode AccStoreServer::RecoverAliveRankIds(std::unordered_set<uint32_t> &outRanks) noexcept
@@ -1628,7 +1843,17 @@ void AccStoreServer::CleanupStaleRanks() noexcept
         }
 
         // 更新 etcd 持久化的 alive rank 列表
-        if (PersistAliveRankIds(aliveRankSet_) != SUCCESS) {
+        /* 与 LinkBrokenHandler 共用同一删除判据（而不是沿用"集合为空就删"的老写法）：
+           ranksToRemove 中可能含"重连后又被心跳超时摘除"的 rank——心跳超时摘除会同时把它从
+           reconnectedRankSet_ 中 erase，故在 cleanup 眼里属于 stale rank；而心跳超时摘除不写回名单，
+           镜像 persistedAliveRanks_ 仍保留这些待恢复项。若清理后存活集为空，PersistAliveRankIds 会
+           直接 Delete(KEY_ALIVE_RANK_LIST)，把下一任 leader 恢复存活名单的唯一来源不可逆地抹掉，
+           正是本次修复要避免的后果，故存在保留项时只跳过该删除、不落盘空名单。 */
+        if (aliveRankSet_.empty() && HasPersistedRanksOutside(aliveRankSet_, std::numeric_limits<uint32_t>::max())) {
+            STORE_LOG_WARN("skip deleting " << KEY_ALIVE_RANK_LIST
+                                            << " after cleaning stale ranks, persisted alive ranks still hold "
+                                               "ranks pending recovery");
+        } else if (PersistAliveRankIds(aliveRankSet_) != SUCCESS) {
             STORE_LOG_ERROR("Failed to persist alive ranks after cleaning stale ranks");
         }
     }
@@ -2195,14 +2420,19 @@ AccStoreServer::ClusterStatusSnapshot AccStoreServer::CaptureClusterStatus() noe
     snap.backendAliveRanks = aliveRankFromBackend_;
     snap.aliveRanks = aliveRankSet_;
     snap.reconnectedRanks = reconnectedRankSet_;
-    const int64_t nowMs = mf::StrUtil::GetNowTime();
-    snap.heartbeats.reserve(heartBeatMap_.size());
-    for (const auto &item : heartBeatMap_) {
+    const int64_t nowMs = NowMonotonicMs();
+    std::unordered_map<uint32_t, HeartbeatRecord> heartBeatSnapshot;
+    {
+        std::lock_guard<std::mutex> heartBeatGuard{heartBeatMutex_};
+        heartBeatSnapshot = heartBeatMap_;
+    }
+    snap.heartbeats.reserve(heartBeatSnapshot.size());
+    for (const auto &item : heartBeatSnapshot) {
         const uint32_t rankId = GetRankIdByLinkId(item.first); // storeMutex_ 已持有
         if (rankId == UINT32_MAX) {
             continue; // 尚未建立 rank 映射的连接不输出
         }
-        snap.heartbeats.emplace_back(rankId, nowMs - item.second);
+        snap.heartbeats.emplace_back(rankId, nowMs - item.second.stampMs);
     }
     std::sort(snap.heartbeats.begin(), snap.heartbeats.end());
     if (groupManager_ != nullptr) {

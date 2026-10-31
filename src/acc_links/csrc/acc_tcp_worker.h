@@ -46,6 +46,19 @@ public:
     void RegisterRequestSentHandler(const AccReqSentHandler &h);
     void RegisterLinkBrokenHandler(const LinkBrokenHandlerInner &h);
 
+    /*
+     * @brief 累计不可观测时长(ms)：单轮 epoll 迭代墙钟耗时超出轮询预算的部分之和，含当前这一轮。
+     *        worker 被长耗时回调占住期间收不到也记不了心跳，上层据此从心跳静默时长中扣除。
+     */
+    uint64_t UnobservableMs() const noexcept;
+
+    /*
+     * @brief 由相邻两轮迭代的起始时刻计算本轮超出预算的时长
+     * @param prevIterStartUs [in] 上一轮迭代起始时刻(us)，0 表示首轮
+     * @return 超出轮询预算的时长(ms)，未超出返回 0
+     */
+    static uint64_t CalcOverrunMs(uint64_t iterStartUs, uint64_t prevIterStartUs, uint32_t budgetMs) noexcept;
+
 private:
     void SetPropertiesForThread();
     void RunInThread(std::atomic<bool> *started);
@@ -56,6 +69,15 @@ private:
     Result ProcessPollOut(AccTcpLinkDefault *link) noexcept;
     Result ProcessPollWrNorm(AccTcpLinkDefault *link) noexcept;
     void ProcessBufferedRequest(AccTcpLinkDefault *link) noexcept;
+
+private:
+    /* 空闲一轮约耗时 pollingTimeoutMs，叠加余量后才计为超支，避免调度抖动被计入 */
+    static constexpr uint32_t kPollBudgetMarginMs = 100U;
+
+    uint32_t PollBudgetMs() const noexcept
+    {
+        return options_.pollingTimeoutMs + kPollBudgetMarginMs;
+    }
 
 private:
     int epollFD_ = -1;      /* epoll fd */
@@ -70,6 +92,10 @@ private:
     std::atomic<bool> started_{false}; /* if the worker started */
     std::thread epollThread_;          /* thread */
     std::atomic<bool> threadStarted_{false};
+
+    /* iterStartUs_ 为本轮迭代起始时刻(us)，0 表示尚未进入首轮；由 worker 线程写、判定线程读 */
+    std::atomic<uint64_t> iterStartUs_{0};
+    std::atomic<uint64_t> overrunBaseMs_{0}; /* 已结算的累计超支(ms) */
 };
 using AccTcpWorkerPtr = AccRef<AccTcpWorker>;
 

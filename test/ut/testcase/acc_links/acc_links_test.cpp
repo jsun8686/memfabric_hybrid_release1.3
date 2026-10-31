@@ -420,6 +420,41 @@ TEST_F(AccLinksTest, test_worker_ValidateOptions_NoName)
     ASSERT_TRUE(ret != ACC_OK);
 }
 
+/* 纯函数语义：仅"本轮墙钟耗时超出轮询预算"的部分计入不可观测时长 */
+TEST_F(AccLinksTest, test_worker_calc_overrun_ms)
+{
+    /* 恰好等于预算：不计超支 */
+    ASSERT_EQ(AccTcpWorker::CalcOverrunMs(1600000U, 1000000U, 600U), 0U);
+    /* 超出 4ms */
+    ASSERT_EQ(AccTcpWorker::CalcOverrunMs(1604000U, 1000000U, 600U), 4U);
+    /* 超出 5000ms（长耗时回调占住 worker） */
+    ASSERT_EQ(AccTcpWorker::CalcOverrunMs(6600000U, 1000000U, 600U), 5000U);
+    /* 首轮（无上一轮时刻）不计超支 */
+    ASSERT_EQ(AccTcpWorker::CalcOverrunMs(1000000U, 0U, 600U), 0U);
+    /* 时刻未前进：不计超支 */
+    ASSERT_EQ(AccTcpWorker::CalcOverrunMs(1000000U, 1000000U, 600U), 0U);
+}
+
+/* 未启动的 worker 不可观测时长为 0 */
+TEST_F(AccLinksTest, test_worker_unobservable_ms_starts_at_zero)
+{
+    AccTcpWorkerOptions workerOptions;
+    workerOptions.pollingTimeoutMs = UNO_48;
+    AccTcpWorkerPtr worker = new (std::nothrow) AccTcpWorker(workerOptions);
+    ASSERT_TRUE(worker != nullptr);
+    ASSERT_EQ(worker->UnobservableMs(), 0U);
+}
+
+/* 正常运行的 worker 不可观测时长受调度抖动影响可能非零，故只断言在合理上界内；
+   越界下标只告警不崩溃，恒返回 0 */
+TEST_F(AccLinksTest, test_server_worker_unobservable_ms)
+{
+    /* 空闲一轮的墙钟耗时约 workerPollTimeoutMs(48ms)+预算余量(100ms)，正常运行时应远低于该上界；
+       上界只用于防回归，不依赖"恰好为 0" */
+    ASSERT_LE(mServer->GetWorkerUnobservableMs(0U), UNO_1000);
+    ASSERT_EQ(mServer->GetWorkerUnobservableMs(UNO_256), 0U);
+}
+
 TEST_F(AccLinksTest, test_server_connect_to_peer_server_should_return_ok)
 {
     const std::string nextIp = "127.0.0.1";

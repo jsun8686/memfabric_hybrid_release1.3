@@ -281,7 +281,12 @@ void AccTcpServerDefault::StopAndCleanWorkers(bool afterFork)
     for (auto &item : workers_) {
         item->Stop(afterFork);
     }
-    workers_.clear();
+    {
+        /* clear 会释放 worker 对象，须与 GetWorkerUnobservableMs 的读侧互斥；
+           Stop 会 join 线程故不能持锁，仅在清空容器这一刻加锁 */
+        std::lock_guard<std::mutex> workersGuard(workersMutex_);
+        workers_.clear();
+    }
     connectedLinks_.clear();
 }
 
@@ -431,6 +436,27 @@ Result AccTcpServerDefault::HandleNewConnection(const AccConnReq &req, const Acc
     }
 
     return ACC_OK;
+}
+
+uint64_t AccTcpServerDefault::GetWorkerUnobservableMs(uint32_t workerIdx) const
+{
+    /* 查询可能与 StopAndCleanWorkers 的 clear 并发（clear 会释放 worker 对象），故读侧须持
+       workersMutex_ 叶子锁；不复用 mutex_ 以避免与断链回调路径上的长持锁相互牵连 */
+    std::lock_guard<std::mutex> workersGuard(workersMutex_);
+    if (workerIdx >= workers_.size()) {
+        /* 本函数位于心跳巡检热路径上（按每条心跳记录调用）：服务停止时 workers_ 已被 clear、
+           或 worker 列表变更后会持续命中越界，属可预期的过渡态。若按次打 WARN 会形成日志风暴，
+           故进程内仅在首次出现时提示一次。 */
+        static std::atomic<bool> invalidWorkerIdxReported{false};
+        bool expected = false;
+        if (invalidWorkerIdxReported.compare_exchange_strong(expected, true)) {
+            LOG_WARN("Query unobservable time with invalid worker index "
+                     << workerIdx << ", worker size " << workers_.size() << " (further occurrences suppressed)");
+        }
+        return 0;
+    }
+    const auto &worker = workers_[workerIdx];
+    return worker.Get() != nullptr ? worker->UnobservableMs() : 0;
 }
 
 Result AccTcpServerDefault::WorkerSelect()

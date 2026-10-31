@@ -399,7 +399,7 @@ public:
     virtual Result EnqueueFront(AccLinkedMessageNode *node) = 0;
     virtual AccLinkedMessageNode *DequeueFront() = 0;
 
-    virtual uint32_t GetWorkerIndex() const
+    virtual uint32_t GetWorkerIndex() const override
     {
         return workerIndex_;
     }

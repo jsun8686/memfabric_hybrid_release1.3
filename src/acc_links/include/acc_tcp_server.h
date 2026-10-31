@@ -188,6 +188,19 @@ public:
     virtual int32_t LoadDynamicLib(const std::string &dynLibPath) = 0;
 
     ~AccTcpServer() override = default;
+
+    /*
+     * @brief 取指定 worker 的累计不可观测时长(ms)，语义见 AccTcpWorker::UnobservableMs
+     *
+     * 追加在虚函数序列末尾，避免改变既有 vtable 槽位下标而破坏 ABI 兼容性。
+     *
+     * @param workerIdx    [in] worker 下标，越界返回 0
+     * @return 累计不可观测时长(ms)，实现不支持该统计时返回 0
+     */
+    virtual uint64_t GetWorkerUnobservableMs(uint32_t workerIdx) const
+    {
+        return 0;
+    }
 };
 
 inline int32_t AccTcpServer::Start(const ock::acc::AccTcpServerOptions &opt)

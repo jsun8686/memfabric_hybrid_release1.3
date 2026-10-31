@@ -137,6 +137,21 @@ public:
     };
 
 private:
+    /* 断链原因：决定是否允许同步持久化存活名单。心跳超时仅表示本窗口内未观测到心跳，可能由
+       本进程线程饥饿或被冻结导致观测失效，也可能对端确实停止上报，不等价于对端真的退出。 */
+    enum class BrokenReason : uint32_t {
+        TCP_BROKEN,        /* acc 层检测到真实链路断开 */
+        HEARTBEAT_TIMEOUT, /* 心跳巡检判定超时 */
+    };
+
+    /* 心跳记录：除心跳时刻外，记录该时刻链路所属 worker 的累计不可观测时长快照；
+       判定时以两次快照之差，从静默时长中扣除本进程不可观测的窗口。stampMs 为单调时钟毫秒。 */
+    struct HeartbeatRecord {
+        int64_t stampMs{0};    /* 最近一次心跳时刻（单调时钟 ms） */
+        uint64_t unobsMs{0};   /* 该时刻所属 worker 的累计不可观测时长(ms) */
+        uint32_t workerIdx{0}; /* 链路所属 worker 下标 */
+    };
+
     // 持有 storeMutex_ 拷出集群状态快照：仅做数据拷贝（短持锁），GM 三维度经 GetSnapshot
     // 单次持锁拷贝，保证与 server 级集合同一状态机瞬间
     ClusterStatusSnapshot CaptureClusterStatus() noexcept;
@@ -144,7 +159,24 @@ private:
     Result ReceiveMessageHandler(const ock::acc::AccTcpRequestContext &context) noexcept;
     Result LinkConnectedHandler(const ock::acc::AccConnReq &req, const ock::acc::AccTcpLinkComplexPtr &link) noexcept;
     Result LinkBrokenHandler(const ock::acc::AccTcpLinkComplexPtr &link) noexcept;
-    Result LinkBrokenHandler(uint32_t linkId) noexcept;
+    Result LinkBrokenHandler(uint32_t linkId, BrokenReason reason) noexcept;
+
+    /* 当前单调时钟(ms)，心跳时间戳与巡检判定的统一时基 */
+    static int64_t NowMonotonicMs() noexcept;
+
+    /* 本链路自上次心跳以来其所属 worker 处于不可观测状态的时长(ms)，即应从静默时长中扣除的
+       部分。accServer 为调用方在 storeMutex_ 锁内取出的 acc 服务句柄快照；本函数自身不获取
+       任何 store 锁。 */
+    uint64_t UnobservableDeltaMs(const HeartbeatRecord &record, int64_t rawElapsedMs,
+                                 const ock::acc::AccTcpServerPtr &accServer) noexcept;
+
+    /* 由前后两次不可观测时长快照与静默时长计算应扣除量(ms)：快照未增长时返回 0，否则取差值
+       并按静默时长封顶（快照差可能大于静默时长）。 */
+    static uint64_t ClampUnobservableDeltaMs(uint64_t prevUnobsMs, uint64_t curUnobsMs, int64_t rawElapsedMs) noexcept;
+
+    /* 判定单条链路本次是否心跳超时：静默时长扣除本进程不可观测窗口后与阈值比较。
+       timeoutMs <= 0 表示关闭巡检。 */
+    static bool IsHeartbeatExpired(int64_t rawElapsedMs, uint64_t unobservableMs, int64_t timeoutMs) noexcept;
     void GetWakeupList(const std::string &key, std::list<ock::acc::AccTcpRequestContext> &waiters,
                        std::list<ock::acc::AccTcpRequestContext> &watchers) noexcept;
 
@@ -237,10 +269,40 @@ private:
     std::unordered_set<uint32_t> aliveRankSet_;
     std::unordered_set<uint32_t> reconnectedRankSet_;    // only ranks that actually reconnected after startup
     std::unordered_map<uint32_t, uint32_t> linkRankMap_; // linkId → rankId, in-memory only, no etcd
+    /* linkRankMap_ 的独立叶子锁：上层注册的断链回调（memcache 侧 ClearResource → RemoveBlobs）
+       经 GetRankIdByLinkId 读本表时并不持有 storeMutex_（回调必须在 storeMutex_ 之外执行），
+       故表内读写统一由本锁串行，避免无锁 find 撞上加锁写引起的 rehash UB。
+       锁序固定为 storeMutex_ → linkRankMutex_，禁止反向获取。 */
+    mutable std::mutex linkRankMutex_;
+    /* 心跳巡检判定超时、即将经 ReleaseLink 断链的 linkId 集合（storeMutex_ 保护）。
+       ReleaseLink 复用 acc 标准断链路径，回调不携带原因，故用该标记让回调还原为
+       HEARTBEAT_TIMEOUT。 */
+    std::unordered_set<uint32_t> heartbeatTimeoutLinkIds_;
+    /* 后端 KEY_ALIVE_RANK_LIST 的本地镜像：记录"上次成功持久化所代表的集合"（storeMutex_ 保护）。
+       心跳超时摘除的 rank 不会写回该名单（见 LinkBrokenHandler），因此镜像可能比 aliveRankSet_ 多出
+       这些被保留的 rank；集群全断时据此判断删除会不会连带丢掉它们的恢复窗口。 */
+    std::unordered_set<uint32_t> persistedAliveRanks_;
     ConfigStoreServerBrokenHandler externalBrokenHandler_{nullptr};
-    std::unordered_map<uint32_t, int64_t> heartBeatMap_;
+    /* 上层断链回调（memcache 侧 ClearResource → RemoveBlobs，百万级元数据下为全表扫描）的串行化锁。
+       断链回调由 acc 各自的 worker 线程回调（多个 rank 同时断链即多线程并发进入 LinkBrokenHandler），
+       修复前该回调在 storeMutex_ 临界区内调用、被全局串行化；为缩短持锁把它移到锁外后，必须用这把
+       独立锁（而非 storeMutex_，否则又回到"断链清理全程持 store 锁"）保证同一时刻只有一个回调在执行，
+       避免不可重入的元数据回收被并发执行。锁序固定为 externalBrokenCallbackMutex_ → linkRankMutex_
+       （回调经 GetRankIdByLinkId 读 linkRankMap_），禁止反向获取。 */
+    std::mutex externalBrokenCallbackMutex_;
+    /* heartBeatMap_ 使用独立锁保护：心跳写入处于热路径，不能与断链清理（可能秒级持锁）
+       共用 storeMutex_，否则清理会同时堵住心跳的"收"与"记"。
+       锁序固定为 storeMutex_ → heartBeatMutex_。 */
+    std::mutex heartBeatMutex_;
+    std::unordered_map<uint32_t, HeartbeatRecord> heartBeatMap_;
     uint32_t heartBeatTimeoutS_;
     std::thread checkerThread_;
+    /* 心跳巡检线程标识（storeMutex_ 保护）。LinkBrokenHandler(link) 需区分本次断链是"巡检线程
+       经 ReleaseLink 主动发起"（HEARTBEAT_TIMEOUT）还是"acc worker 线程上报的真实 TCP 断链"
+       （TCP_BROKEN）：两条路径复用同一回调、均不携带原因，只能用调用线程身份区分。仅在回调确实
+       发生在巡检线程上时才信任 heartbeatTimeoutLinkIds_ 标记，避免预置标记把真实断链误判为
+       心跳超时（从而漏删 KEY_ALIVE_RANK_LIST，该删不删）。 */
+    std::thread::id checkerThreadId_{};
     SmemGroupManagerServerPtr groupManager_;
     SmemGroupCommandSender sender_;
     std::unique_ptr<EtcdStateStore> etcdStore_;
@@ -248,6 +310,10 @@ private:
     std::unordered_map<uint32_t, uint32_t> linkToRankMap_;
 
     uint32_t LookupRankIdByLink(uint32_t linkId) noexcept;
+    /* persistedAliveRanks_ 中是否存在 aliveRanks 之外、且不等于 excludeRank 的 rank，即"被心跳
+       超时保留、尚未确认退出"的项。excludeRank 用于排除本次刚确认退出的 rank：它本就在镜像里，
+       不排除会把"该删"误判成"有保留项"而拒绝删除（storeMutex_ 保护，调用方须已持锁）。 */
+    bool HasPersistedRanksOutside(const std::unordered_set<uint32_t> &aliveRanks, uint32_t excludeRank) const noexcept;
 };
 using AccStoreServerPtr = SmRef<AccStoreServer>;
 } // namespace ock::smem

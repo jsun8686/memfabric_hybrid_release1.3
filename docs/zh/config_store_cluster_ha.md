@@ -45,7 +45,7 @@ TCP 服务器通过内部的 AccTcpServer 组件启动，它侦听客户端连�
 | Leader 健康检查间隔  | 4 秒                 | 检测 ETCD 连接和 Lease 状态                             |
 | 随机退避           | 100-1000ms          | 避免选举惊群                                           |
 | 网络检查超时         | 1 秒                 | 判断 Leader 是否可达（源码中 kConnectTimeoutMs = 1000）|
-| 心跳超时 | 默认 60 秒 | `MF_CONFIG_STORE_HEARTBEAT_TIMEOUT_S`；0 表示永不超时，检测周期为 2 秒 |
+| 心跳超时 | 默认 60 秒 | `MF_CONFIG_STORE_HEARTBEAT_TIMEOUT_S`；0 表示永不超时，检测周期为 2 秒。判定前先扣除"本进程不可观测时长"，详见 1.5 节 |
 | 恢复等待           | 5秒                    | 新 Leader 等待旧 Rank 重连（源码中 SERVER_RECOVER_TIME = 5s，单阶段等待）|
 | 客户端重连次数        | 60 次 (间隔1秒)         | Client 最大重连尝试次数，每次间隔1秒                           |
 
@@ -113,8 +113,8 @@ N2->>N2: 进程退出 / 网络断开
 N2--xStore: TCP 连接断开
 
 rect rgb(255, 245, 238)
-Note over Store: Server 端处理
-Store->>Store: LinkBrokenHandler(linkId)
+Note over Store: Server 端处理（真实 TCP 断开 → TCP_BROKEN）
+Store->>Store: LinkBrokenHandler(linkId, TCP_BROKEN)
 Store->>Store: 从 kvStore_ 查找对应 rankId
 Store->>Store: aliveRankSet_.erase(rankId=1)
 Store->>Store: heartBeatMap_.erase(linkId)
@@ -126,6 +126,12 @@ Store->>N1: 通知 Watch 回调 (WATCH_RANK_LINK_DOWN)
 
 Note over Store: ✅ 集群状态: aliveRankSet_ = {0}
 ```
+
+> [!NOTE] 断链原因区分
+> 除真实 TCP 断开（`TCP_BROKEN`）外，`LinkBrokenHandler` 还会被心跳巡检以 `HEARTBEAT_TIMEOUT` 触发。
+> 心跳超时仅表示服务端在该窗口内**未观测到心跳**：可能是**服务端侧观测失效**（例如本进程 acc worker 线程被长耗时回调占满），
+> 也可能是对端确实停止上报（观测正常但无心跳到达），二者无法从超时本身区分，不等价于 rank 真的退出，
+> 因此**不同步持久化存活名单**——既不写也不删除 `KEY_ALIVE_RANK_LIST`，详见 1.5 节。
 
 ### 1.3 节点1 (Config Store) 下线 ⚠️ 灾难性故障
 
@@ -184,6 +190,66 @@ Note over Store: aliveRankSet_ = {0, 1, 2}
 else worldSize 不足
 Store-->>N3: ERROR: worldSize exceeded
 N3->>N3: 初始化失败
+end
+```
+
+### 1.5 心跳超时判定与存活名单保护
+
+**背景**: 客户端周期性上报心跳，服务端 `CheckerThreadTask` 按巡检周期（默认 2 秒）扫描 `heartBeatMap_` 判定超时。以下场景会出现误判：服务端进程内的 acc worker 线程被长耗时回调占满（上层断链清理在百万级元数据下为全表扫描，单次可达秒级），期间心跳既收不到也记不上，导致**线程拿到执行权时所有时间戳都已过期、健康链路被批量误剔除**。
+
+#### 判定语义：逐链路扣除"本进程不可观测时长"
+
+| 项           | 说明                                                                                          |
+|-------------|---------------------------------------------------------------------------------------------|
+| 静默时长        | `now - 心跳记录时间戳`；时间戳与不可观测时长必须同源单调时钟，否则扣除速率不一致会导致判定失效                                          |
+| 不可观测时长      | acc worker **累计**的"单轮 epoll 迭代墙钟耗时超出轮询预算"的时长；预算 = `workerPollTimeoutMs`（默认 500ms）+ 100ms 余量，**包含当前尚未结束的这一轮**，worker 卡死期间该值持续增长 |
+| 有效静默        | `静默时长 - Δ不可观测时长`（Δ 取相邻两次快照之差，按静默时长封顶）                                                       |
+| 超时条件        | `有效静默 >= MF_CONFIG_STORE_HEARTBEAT_TIMEOUT_S`，即**只扣除、不放松阈值**                                 |
+
+心跳记录因此携带 `{stampMs, unobsMs, workerIdx}` 三元组，`unobsMs` 为记录写入时刻所属 worker 的累计不可观测时长快照。被豁免的链路按轮汇总输出一条 WARN 日志（天然限频），便于确认保护是否生效。
+
+#### 断链原因与存活名单保护
+
+`LinkBrokenHandler` 按原因区分语义：
+
+| 原因                 | 触发方          | 语义                                      | 同步持久化 `KEY_ALIVE_RANK_LIST` |
+|--------------------|--------------|-----------------------------------------|-----------------------------|
+| `TCP_BROKEN`       | acc 层检测到真实链路断开 | rank 确实离开                               | ✅ 改写 / 清空时删除                |
+| `HEARTBEAT_TIMEOUT` | 巡检判定静默超时      | **本窗口内未观测到心跳**：可能由本进程线程饥饿或被冻结导致观测失效，也可能对端确实停止上报 | ❌ 不写也不删，仅回收内存态             |
+
+保护要点：心跳超时属推论性断链，不足以触发**不可逆**的 `Delete(KEY_ALIVE_RANK_LIST)`（后端 key 路径为 `/memfabric_hybrid/config_store/data/alive_rank_list`，即上表 `ETCD_KEY_ALIVE_RANKS` 所指对象）——该 key 一旦误删，重启后的 rank 将永远无法重新注册。超时路径只回收内存态（`aliveRankSet_` / `linkRankMap_` / `rankLinks_`），持久化名单保持原样，等待真实断链或 rank 正常 CheckIn 时再更新；全断分支仍会清空内存数据，但仅打印 WARN 提示原因。
+
+注意删除有**两条**路径，二者都必须拦住：
+
+1. `PersistAliveRankIds(aliveRankSet_)` 在集合清空（最后一条链路断开）时会执行 `Delete(KEY_ALIVE_RANK_LIST)`；
+2. 全断分支（`aliveRankSet_.empty()`）末尾的显式 `Delete(KEY_ALIVE_RANK_LIST)`。
+
+```mermaid
+sequenceDiagram
+autonumber
+participant HC as 客户端
+participant Store as AccStoreServer
+participant W as acc worker 线程
+
+rect rgb(255, 245, 238)
+Note over W: 被长耗时回调占满（秒级）<br/>期间不 poll、不记心跳
+HC--xStore: 心跳未上报
+end
+
+rect rgb(255, 250, 205)
+Note over Store: 巡检周期到达
+Store->>Store: CheckerThreadTask 计算静默时长
+Store->>Store: Δ不可观测时长 = 两次快照之差
+Store->>Store: 有效静默 = 静默 - Δ
+end
+
+alt 有效静默 < 阈值
+Note over Store: ✅ 豁免，链路保留（记录汇总 WARN）
+else 有效静默 >= 阈值
+Store->>Store: LinkBrokenHandler(linkId, HEARTBEAT_TIMEOUT)
+Store->>Store: 回收内存态，按 TCP_BROKEN 才同步
+Store->>Store: 跳过 Delete(KEY_ALIVE_RANK_LIST)
+Note over Store: ⚠️ 全断分支仅打印 WARN，持久化名单保持
 end
 ```
 
