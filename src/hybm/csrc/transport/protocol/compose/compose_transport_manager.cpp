@@ -80,9 +80,9 @@ Result ComposeTransportManager::OpenDeviceTransport(const TransportOptions &opti
         if (useHcomm) {
             deviceTransportManager_ = std::make_shared<device::DeviceRdmaHcommTransportManager>();
         } else {
-            // AICPU 直发开关（默认关闭）：打开后用 AI QP + AICPU kernel 提交 WQE，host 仅敲 doorbell。
+            // AICPU 直发开关（默认打开）：打开后用 AI QP + AICPU kernel 提交 WQE，host 仅敲 doorbell。
             // 仅适用于非 HYBM_TYPE_AI_CORE_INITIATE 场景（AI_CORE_INITIATE 用 FixedRanksQpManager，走基类）。
-            static const bool aicpuEnabled = MfEnvUtil::GetOptionalUintOrDefault(env::MF_HYBM_RDMA_USE_AICPU, 0u) != 0u;
+            static const bool aicpuEnabled = MfEnvUtil::GetOptionalUintOrDefault(env::MF_HYBM_RDMA_USE_AICPU, 1U) != 0U;
             const bool useAicpu = aicpuEnabled && (options.initialType != HYBM_TYPE_AI_CORE_INITIATE);
             if (useAicpu) {
                 BM_LOG_INFO("using AICPU device RDMA transport, rankId: " << options.rankId);
