@@ -16,205 +16,97 @@
 #include <string>
 
 #include <gtest/gtest.h>
-#include "transfer_util.h"
+#include "acc_tcp_port_util.h"
+#include "smem_trans/smem_trans_connection.h"
 
-using namespace ock::adapter;
+// 说明：uniqueId(ip:port) 解析与 MF_CONFIG_STORE_PORT_START/END 端口范围的环境变量
+// 解析逻辑已内聚为 smem_trans_entry.cpp 的文件内静态函数（由 SmemTransTest 的 fork 用例
+// 端到端覆盖）；此处覆盖可直测的公开接口：ParseTransName 与 AccFindAvailableTcpPort。
+
+using namespace ock::smem;
 
 namespace {
 constexpr uint16_t K_PORT_ZERO = 0;
-constexpr uint16_t K_DEF_MIN = DEFAULT_PORT_START; // 9000
-constexpr uint16_t K_DEF_MAX = DEFAULT_PORT_MAX;   // 65535
+constexpr uint16_t K_RANGE_MIN = 9000;
+constexpr uint16_t K_RANGE_MAX = 65535;
 constexpr uint16_t K_ENV_MIN = 49300;
 constexpr uint16_t K_ENV_MAX = 49350;
 constexpr int K_INVALID_FD = -1;
 } // namespace
 
-class ParseIpPortFromUniqueIdTest : public testing::Test {};
+// ===== SmemTransConnection::ParseTransName: trans uniqueId (ip:port) parsing =====
 
-TEST_F(ParseIpPortFromUniqueIdTest, Ipv4WithPort)
+class ParseTransNameTest : public testing::Test {};
+
+TEST_F(ParseTransNameTest, Ipv4WithPort)
 {
-    std::string ip;
+    ock::mf::net_addr_t ip{};
     uint16_t port = 1;
-    ParseIpPortFromUniqueId("127.0.0.1:10000", ip, port);
-    EXPECT_EQ(ip, "127.0.0.1");
+    EXPECT_TRUE(SmemTransConnection::ParseTransName("127.0.0.1:10000", ip, port));
+    EXPECT_EQ(ip.type, ock::mf::IpV4);
     EXPECT_EQ(port, 10000);
 }
 
-TEST_F(ParseIpPortFromUniqueIdTest, Ipv4OnlyAutoSelect)
+TEST_F(ParseTransNameTest, Ipv4PortMaxBoundary)
 {
-    std::string ip;
+    ock::mf::net_addr_t ip{};
     uint16_t port = 1;
-    ParseIpPortFromUniqueId("127.0.0.1", ip, port);
-    EXPECT_EQ(ip, "127.0.0.1");
-    EXPECT_EQ(port, K_PORT_ZERO);
-}
-
-TEST_F(ParseIpPortFromUniqueIdTest, PortZeroMeansAutoSelect)
-{
-    std::string ip;
-    uint16_t port = 1;
-    ParseIpPortFromUniqueId("127.0.0.1:0", ip, port);
-    EXPECT_EQ(ip, "127.0.0.1");
-    EXPECT_EQ(port, K_PORT_ZERO);
-}
-
-TEST_F(ParseIpPortFromUniqueIdTest, TrailingColonStripped)
-{
-    std::string ip;
-    uint16_t port = 1;
-    ParseIpPortFromUniqueId("127.0.0.1:", ip, port);
-    EXPECT_EQ(ip, "127.0.0.1");
-    EXPECT_EQ(port, K_PORT_ZERO);
-}
-
-TEST_F(ParseIpPortFromUniqueIdTest, PortMaxBoundary)
-{
-    std::string ip;
-    uint16_t port = 0;
-    ParseIpPortFromUniqueId("10.0.0.1:65535", ip, port);
-    EXPECT_EQ(ip, "10.0.0.1");
+    EXPECT_TRUE(SmemTransConnection::ParseTransName("10.0.0.1:65535", ip, port));
+    EXPECT_EQ(ip.type, ock::mf::IpV4);
     EXPECT_EQ(port, 65535);
 }
 
-TEST_F(ParseIpPortFromUniqueIdTest, PortOverflowTreatedAsIp)
+TEST_F(ParseTransNameTest, Ipv6BracketedWithPort)
 {
-    std::string ip;
+    ock::mf::net_addr_t ip{};
     uint16_t port = 1;
-    ParseIpPortFromUniqueId("10.0.0.1:65536", ip, port);
-    EXPECT_EQ(ip, "10.0.0.1:65536");
-    EXPECT_EQ(port, K_PORT_ZERO);
+    EXPECT_TRUE(SmemTransConnection::ParseTransName("[::1]:10001", ip, port));
+    EXPECT_EQ(ip.type, ock::mf::IpV6);
+    EXPECT_EQ(port, 10001);
 }
 
-TEST_F(ParseIpPortFromUniqueIdTest, NonNumericSuffixTreatedAsIp)
+TEST_F(ParseTransNameTest, Ipv4WithoutPortRejected)
 {
-    std::string ip;
+    ock::mf::net_addr_t ip{};
     uint16_t port = 1;
-    ParseIpPortFromUniqueId("host:abc", ip, port);
-    EXPECT_EQ(ip, "host:abc");
-    EXPECT_EQ(port, K_PORT_ZERO);
+    EXPECT_FALSE(SmemTransConnection::ParseTransName("127.0.0.1", ip, port));
 }
 
-TEST_F(ParseIpPortFromUniqueIdTest, HugePortValueThrowsHandled)
+TEST_F(ParseTransNameTest, PrivilegedPortRejected)
 {
-    std::string ip;
+    // url 解析要求端口 > 1024（与 smem HA 层约定一致）
+    ock::mf::net_addr_t ip{};
     uint16_t port = 1;
-    ParseIpPortFromUniqueId("10.0.0.1:99999999999999999999", ip, port);
-    EXPECT_EQ(ip, "10.0.0.1:99999999999999999999");
-    EXPECT_EQ(port, K_PORT_ZERO);
+    EXPECT_FALSE(SmemTransConnection::ParseTransName("127.0.0.1:80", ip, port));
 }
 
-TEST_F(ParseIpPortFromUniqueIdTest, EmptyInput)
+TEST_F(ParseTransNameTest, PortOverflowRejected)
 {
-    std::string ip = "x";
+    ock::mf::net_addr_t ip{};
     uint16_t port = 1;
-    ParseIpPortFromUniqueId("", ip, port);
-    EXPECT_TRUE(ip.empty());
-    EXPECT_EQ(port, K_PORT_ZERO);
+    EXPECT_FALSE(SmemTransConnection::ParseTransName("10.0.0.1:65536", ip, port));
 }
 
-TEST_F(ParseIpPortFromUniqueIdTest, Ipv6BracketedWithPort)
+TEST_F(ParseTransNameTest, InvalidIpRejected)
 {
-    std::string ip;
-    uint16_t port = 0;
-    ParseIpPortFromUniqueId("[::1]:8080", ip, port);
-    EXPECT_EQ(ip, "[::1]");
-    EXPECT_EQ(port, 8080);
-}
-
-TEST_F(ParseIpPortFromUniqueIdTest, Ipv6BracketedAutoSelect)
-{
-    std::string ip;
+    ock::mf::net_addr_t ip{};
     uint16_t port = 1;
-    ParseIpPortFromUniqueId("[::1]", ip, port);
-    EXPECT_EQ(ip, "[::1]");
-    EXPECT_EQ(port, K_PORT_ZERO);
+    EXPECT_FALSE(SmemTransConnection::ParseTransName("host:10000", ip, port));
 }
 
-class GetConfigStorePortRangeTest : public testing::Test {
+TEST_F(ParseTransNameTest, EmptyInputRejected)
+{
+    ock::mf::net_addr_t ip{};
+    uint16_t port = 1;
+    EXPECT_FALSE(SmemTransConnection::ParseTransName("", ip, port));
+}
+
+// ===== acc::AccFindAvailableTcpPort: tcp port probing =====
+
+class AccFindAvailableTcpPortTest : public testing::Test {
 public:
     void SetUp() override
     {
-        (void)unsetenv("MF_CONFIG_STORE_PORT_START");
-        (void)unsetenv("MF_CONFIG_STORE_PORT_END");
-    }
-
-    void TearDown() override
-    {
-        (void)unsetenv("MF_CONFIG_STORE_PORT_START");
-        (void)unsetenv("MF_CONFIG_STORE_PORT_END");
-    }
-};
-
-TEST_F(GetConfigStorePortRangeTest, DefaultsWhenEnvUnset)
-{
-    uint16_t minP = 1;
-    uint16_t maxP = 1;
-    GetConfigStorePortRange(minP, maxP);
-    EXPECT_EQ(minP, K_DEF_MIN);
-    EXPECT_EQ(maxP, K_DEF_MAX);
-}
-
-TEST_F(GetConfigStorePortRangeTest, RespectsEnvRange)
-{
-    (void)setenv("MF_CONFIG_STORE_PORT_START", "49300", 1);
-    (void)setenv("MF_CONFIG_STORE_PORT_END", "49350", 1);
-
-    uint16_t minP = 0;
-    uint16_t maxP = 0;
-    GetConfigStorePortRange(minP, maxP);
-    EXPECT_EQ(minP, K_ENV_MIN);
-    EXPECT_EQ(maxP, K_ENV_MAX);
-}
-
-TEST_F(GetConfigStorePortRangeTest, InvalidEnvValueFallsBack)
-{
-    (void)setenv("MF_CONFIG_STORE_PORT_START", "notanumber", 1);
-
-    uint16_t minP = 0;
-    uint16_t maxP = 0;
-    GetConfigStorePortRange(minP, maxP);
-    EXPECT_EQ(minP, K_DEF_MIN);
-    EXPECT_EQ(maxP, K_DEF_MAX);
-}
-
-TEST_F(GetConfigStorePortRangeTest, EnvZeroFallsBack)
-{
-    (void)setenv("MF_CONFIG_STORE_PORT_START", "0", 1);
-
-    uint16_t minP = 0;
-    uint16_t maxP = 0;
-    GetConfigStorePortRange(minP, maxP);
-    EXPECT_EQ(minP, K_DEF_MIN);
-}
-
-TEST_F(GetConfigStorePortRangeTest, EnvOverflowFallsBack)
-{
-    (void)setenv("MF_CONFIG_STORE_PORT_END", "99999", 1);
-
-    uint16_t minP = 0;
-    uint16_t maxP = 0;
-    GetConfigStorePortRange(minP, maxP);
-    EXPECT_EQ(maxP, K_DEF_MAX);
-}
-
-TEST_F(GetConfigStorePortRangeTest, ReversedRangeFallsBack)
-{
-    (void)setenv("MF_CONFIG_STORE_PORT_START", "20000", 1);
-    (void)setenv("MF_CONFIG_STORE_PORT_END", "10000", 1);
-
-    uint16_t minP = 0;
-    uint16_t maxP = 0;
-    GetConfigStorePortRange(minP, maxP);
-    EXPECT_EQ(minP, K_DEF_MIN);
-    EXPECT_EQ(maxP, K_DEF_MAX);
-}
-
-class AccFindAvailableTcpPortAdapterTest : public testing::Test {
-public:
-    void SetUp() override
-    {
-        (void)unsetenv("MF_CONFIG_STORE_PORT_START");
-        (void)unsetenv("MF_CONFIG_STORE_PORT_END");
         sockfd_ = K_INVALID_FD;
     }
 
@@ -224,27 +116,32 @@ public:
             close(sockfd_);
             sockfd_ = K_INVALID_FD;
         }
-        (void)unsetenv("MF_CONFIG_STORE_PORT_START");
-        (void)unsetenv("MF_CONFIG_STORE_PORT_END");
     }
 
     int sockfd_ = K_INVALID_FD;
 };
 
-TEST_F(AccFindAvailableTcpPortAdapterTest, FindsPortInDefaultRange)
+TEST_F(AccFindAvailableTcpPortTest, FindsPortInGivenRange)
 {
-    uint16_t port = AccFindAvailableTcpPortAdapter(sockfd_);
-    EXPECT_GE(port, K_DEF_MIN);
-    EXPECT_LE(port, K_DEF_MAX);
-    EXPECT_GE(sockfd_, 0);
+    auto port = ock::acc::AccFindAvailableTcpPort(sockfd_, K_RANGE_MIN, K_RANGE_MAX);
+    EXPECT_GE(port, K_RANGE_MIN);
+    EXPECT_LE(port, K_RANGE_MAX);
+    EXPECT_GE(sockfd_, 0); // 探测 socket 保持绑定，由调用方持有
 }
 
-TEST_F(AccFindAvailableTcpPortAdapterTest, RespectsEnvRange)
+TEST_F(AccFindAvailableTcpPortTest, RespectsNarrowRange)
 {
-    (void)setenv("MF_CONFIG_STORE_PORT_START", "49300", 1);
-    (void)setenv("MF_CONFIG_STORE_PORT_END", "49350", 1);
-
-    uint16_t port = AccFindAvailableTcpPortAdapter(sockfd_);
+    auto port = ock::acc::AccFindAvailableTcpPort(sockfd_, K_ENV_MIN, K_ENV_MAX);
     EXPECT_GE(port, K_ENV_MIN);
     EXPECT_LE(port, K_ENV_MAX);
+}
+
+TEST_F(AccFindAvailableTcpPortTest, ReversedRangeRejected)
+{
+    EXPECT_EQ(ock::acc::AccFindAvailableTcpPort(sockfd_, 20000, 10000), K_PORT_ZERO);
+}
+
+TEST_F(AccFindAvailableTcpPortTest, ZeroMinRejected)
+{
+    EXPECT_EQ(ock::acc::AccFindAvailableTcpPort(sockfd_, 0, 10000), K_PORT_ZERO);
 }

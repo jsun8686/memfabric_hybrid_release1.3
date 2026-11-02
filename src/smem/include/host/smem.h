@@ -45,7 +45,8 @@ extern "C" {
 #define SMEM_RES_IN_USE       (-2009)
 #define SMEM_PARTIAL_FAILED   (-2012)
 #define SMEM_NOT_CONNECTED    (-2014)
-#define SMEM_BUFFER_TOO_SMALL (-2015)
+#define SMEM_NEED_RETRY       (-2015)
+#define SMEM_BUFFER_TOO_SMALL (-2016)
 
 /**
  * @brief Get the MemFabric runtime ABI compatibility version.

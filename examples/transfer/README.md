@@ -6,13 +6,13 @@
 昇腾 NPU 的分布式计算场景。示例通过内存注册与直接内存访问实现节点间数据的高效传输，避免了传统 IO 操作的
 性能开销。
 
-各脚本均以 **Prefill**（数据生产方）与 **Decode**（数据消费方）两类角色运行，双方通过配置存储服务（store）
-协调发现，支持大规模张量数据（torch.Tensor）的传输。
+各脚本均以 **Prefill**（数据生产方）与 **Decode**（数据消费方）两类角色运行，每个实例内部会按自身会话 ID
+（`src-unique-id`）创建配置存储服务（config store），对端按会话 ID 直连该服务完成发现与建链，支持大规模张量
+数据（torch.Tensor）的传输。
 
 | 脚本 | 传输模式 | 说明 |
 |------|---------|------|
 | test_transfer_engine.py | push | 基础跨节点张量传输：Prefill 生成数据并主动写入 Decode |
-| test_quant_trans.py | push | 随路量化传输测试，命令行参数与 test_transfer_engine.py 相同 |
 | test_transfer_engine_rd2h.py | pull | SFA RD2H 场景 PD KV Cache 拉取传输，支持 Decode 侧多 rank |
 
 ## test_transfer_engine.py：基础跨节点传输（push 模式）
@@ -25,7 +25,8 @@
 
 * **Decode 角色**：负责接收并处理 Prefill 节点传输的数据
 
-两者通过配置存储服务（store_url）进行协调，通过 RPC 端口进行通信。
+两者各自在本地创建配置存储服务（config store），Prefill 按 Decode 的会话 ID（`ip:port`）直连其 config store，
+完成信息交换与建链。
 
 ### 使用方法
 
@@ -40,8 +41,8 @@ python test_transfer_engine.py [参数]
 | 参数名             | 必选 | 说明                                               |
 |-----------------|----|--------------------------------------------------|
 | --role          | 是  | 工作角色，可选值：`Prefill` 或 `Decode`                    |
-| --src-unique-id | 否  | 当前节点的会话 ID，格式：`ip:port`                          |
-| --store-url     | 是  | 配置存储服务地址，格式：`tcp://ip:port` 或者 `tcp://[ip]:port` |
+| --src-unique-id | 是  | 当前节点的会话 ID，同时也是本实例内部 config store 的监听地址，格式：`ip:port` |
+| --store-url     | 是  | 兼容参数（脚本仍要求传入，可传任意合法 `tcp://ip:port`）：当前版本config store协议固定为tcp且由各实例自行创建，该参数不再参与对端发现 |
 | --npu-id        | 否  | NPU 设备 ID，默认值：0                                  |
 | --dst-unique-id | 否  | 目标节点会话 ID（仅 Prefill 角色需要），格式：`ip:port`           |
 | --log-level     | 否  | 日志级别：0 (debug)、1 (info)、2 (warn)、3 (error)，默认值：0 |
@@ -75,12 +76,10 @@ python test_transfer_engine.py \
 
 1. **初始化阶段**：
 
-    * 两个节点分别启动并通过`engine.initialize()`初始化 TransferEngine
+    * 两个节点分别启动并通过`engine.initialize()`初始化 TransferEngine，`src-unique-id`即本实例内部config store的监听地址
 
-    * Decode 节点与 Prefill 节点通过`store_url`进行配置同步，两个节点必须使用相同的`store_url`配置以确保能够相互发现
-
-    * 双方通过各自的`src-unique-id`和目标节点的`dst-unique-id`建立通信通道，Prefill 节点的`dst-unique-id`必须与 Decode 节点的
-      `src-unique-id`完全一致（包括端口号）
+    * 对端发现不再依赖`store_url`：Prefill 按 Decode 的`src-unique-id`直连其config store，因此 Prefill 节点的`dst-unique-id`必须与
+      Decode 节点的`src-unique-id`完全一致（包括端口号）
 
 2. **数据传输阶段**：
 
@@ -90,16 +89,12 @@ python test_transfer_engine.py \
 
     * 数据通过直接内存访问方式传输，避免数据拷贝
 
-3. 随路量化测试
-
-    * 将测试脚本由test_transfer_engine.py替换为test_quant_trans.py,参数不变即可，需要手动观测日志打印的ret_quant和ret_scale的sum是否误差在可接受范围内
-
 ### 故障排查
 
 1. **初始化失败**：
 
-    * 检查 store_url 是否可访问（可使用`telnet ip port`验证端口连通性），需使用所有节点均可访问的 TCP 地址，建议使用固定端口（如
-      `tcp://192.168.1.1:23456`）
+    * 确认`src-unique-id`的地址/端口在所有节点可访问（对端会直连该地址的config store，可使用`telnet ip port`验证端口连通性），
+      建议使用固定端口而非自动分配端口
 
     * 确认`src-unique-id`格式正确且未被占用
 

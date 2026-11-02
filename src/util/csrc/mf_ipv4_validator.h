@@ -211,23 +211,27 @@ public:
         if (!initialized_) {
             return {};
         }
-        std::fill_n(reinterpret_cast<uint8_t *>(&peerStorage_), sizeof(peerStorage_), 0);
+        // 同一 parser 会被多个线程复用（例如多个 rank 并发向同一对端 connect），调用方在锁外使用返回的
+        // 指针，若使用成员缓冲区并发调用会相互覆盖：极端情况下 connect() 读到全零地址（family=0），
+        // 内核视为空操作直接返回 0，形成"未连接的假连接"，后续 send 报 EPIPE。故改用调用线程独占的缓冲区。
+        static thread_local sockaddr_storage peerStorage;
+        std::fill_n(reinterpret_cast<uint8_t *>(&peerStorage), sizeof(peerStorage), 0);
         if (is_ipv6_) {
-            auto *addr6 = reinterpret_cast<struct sockaddr_in6 *>(&peerStorage_);
+            auto *addr6 = reinterpret_cast<struct sockaddr_in6 *>(&peerStorage);
             if (inet_pton(AF_INET6, peerIp.c_str(), &addr6->sin6_addr) != 1) {
                 return {};
             }
             addr6->sin6_family = AF_INET6;
             addr6->sin6_port = htons(port);
-            return {reinterpret_cast<const sockaddr *>(&peerStorage_), sizeof(sockaddr_in6)};
+            return {reinterpret_cast<const sockaddr *>(&peerStorage), sizeof(sockaddr_in6)};
         }
-        auto *addr4 = reinterpret_cast<struct sockaddr_in *>(&peerStorage_);
+        auto *addr4 = reinterpret_cast<struct sockaddr_in *>(&peerStorage);
         if (inet_pton(AF_INET, peerIp.c_str(), &addr4->sin_addr) != 1) {
             return {};
         }
         addr4->sin_family = AF_INET;
         addr4->sin_port = htons(port);
-        return {reinterpret_cast<const sockaddr *>(&peerStorage_), sizeof(sockaddr_in)};
+        return {reinterpret_cast<const sockaddr *>(&peerStorage), sizeof(sockaddr_in)};
     }
 
 private:
@@ -324,7 +328,6 @@ private:
     int address_family_ = 0;
     socklen_t addr_len_ = 0;
     sockaddr_storage storage_{};
-    sockaddr_storage peerStorage_{};
     bool initialized_ = false;
     bool is_ipv6_ = false;
 };
@@ -340,14 +343,13 @@ public:
         return instance;
     }
 
+    // 仅按完整 url(ip+port) 缓存与复用 parser：同一端口可能先后/同时对应不同 IP 的 parser
+    // （如服务端 0.0.0.0 与客户端 127.0.0.1），按端口索引无法区分二者，故不再维护端口表。
     std::shared_ptr<UrlParser> CreateParser(const std::string &url)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto find = url2Parsers_.find(url);
         if (find != url2Parsers_.end()) {
-            // 同一端口可能对应不同 IP 的 parser，端口表须始终指向最近一次显式创建的 parser，
-            // 否则按端口取到的地址族/IP 与预期不一致。
-            port2Parsers_[find->second->GetPort()] = find->second;
             return find->second;
         }
         auto *o = new (std::nothrow) UrlParser;
@@ -359,24 +361,12 @@ public:
             return nullptr;
         }
         url2Parsers_[url] = obj;
-        port2Parsers_[obj->GetPort()] = obj;
         return obj;
-    }
-
-    std::shared_ptr<UrlParser> GetParser(const uint32_t serverPort)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto find = port2Parsers_.find(serverPort);
-        if (find == port2Parsers_.end()) {
-            return nullptr;
-        }
-        return find->second;
     }
 
 private:
     std::mutex mutex_{};
     std::unordered_map<std::string, std::shared_ptr<UrlParser>> url2Parsers_{};
-    std::unordered_map<uint32_t, std::shared_ptr<UrlParser>> port2Parsers_{};
     SocketAddressParserMgr() = default;
 };
 

@@ -11,10 +11,6 @@
 */
 #include "smem_trans_entry_manager.h"
 
-#include "smem_net_common.h"
-#include "smem_net_group_engine.h"
-#include "smem_store_factory.h"
-
 namespace ock {
 namespace smem {
 SmemTransEntryManager &SmemTransEntryManager::Instance()
@@ -25,70 +21,37 @@ SmemTransEntryManager &SmemTransEntryManager::Instance()
 
 void SmemTransEntryManager::UnInitialize()
 {
-    ptr2EntryMap_.clear();
     {
         std::lock_guard<std::mutex> guard(entryMutex_);
+        ptr2EntryMap_.clear(); /* each entry uninitializes its connections and executor */
         entryIdx_ = 0;
     }
 }
 
-Result SmemTransEntryManager::CreateEntryByName(const std::string &name, const std::string &storeUrl,
-                                                const smem_trans_config_t &config, SmemTransEntryPtr &entry)
+Result SmemTransEntryManager::CreateEntry(const smem_trans_config_t &config, SmemTransEntryPtr &entry)
 {
-    UrlExtraction extraction;
-    auto ret = extraction.ExtractIpPortFromUrl(storeUrl);
-    SM_VALIDATE_RETURN(ret == SM_OK, "parse store url failed: " << ret, ret);
-
-    StorePtr confStore = StoreFactory::CreateStoreByUrl(storeUrl, ConfigStoreModel::CSM_CLIENT, UINT32_MAX, -1,
-                                                        static_cast<int32_t>(config.initTimeout));
-    SM_VALIDATE_RETURN(confStore != nullptr,
-                       "CreateStoreByUrl failed, storeUrl: " << storeUrl << " initTimeout: " << config.initTimeout
-                                                             << " reason: " << StoreFactory::GetFailedReason(),
-                       StoreFactory::GetFailedReason());
-    confStore = StoreFactory::PrefixStore(confStore, "TRANS_");
-
-    std::vector<uint8_t> rankIdData;
-    uint32_t rank;
-    ret = confStore->GetCoreStore()->Get(AutoRankingStr, rankIdData, SMEM_DEFAUT_WAIT_TIME * SECOND_TO_MILLSEC);
-    if (ret == SM_OK && rankIdData.size() == sizeof(uint32_t)) {
-        union Transfer {
-            uint32_t rankId;
-            uint8_t data[4];
-        } trans{};
-        std::copy_n(rankIdData.begin(), sizeof(trans.data), trans.data);
-        rank = trans.rankId;
-        auto tcpConfigStore = Convert<ConfigStore, ConfigStoreManager>(confStore);
-        tcpConfigStore->SetRankId(static_cast<int32_t>(rank));
-        // TRACE（开关可控）：与 entity Initialize 的合成 rankId（rank*64+entryIdx）对照定位进程/卡；
-        // 多 store 场景补充 storeUrl/clientUrl 定位是哪个对端 store、本端哪个会话
-        SM_LOG_TRACE("Success to auto ranking rankId: " << trans.rankId << " deviceId: " << deviceId_
-                                                        << " storeUrl: " << storeUrl << " clientUrl: " << name);
-    } else {
-        SM_LOG_ERROR("Failed to auto ranking storeUrl: " << storeUrl << " clientUrl: " << name
-                                                         << " deviceId: " << deviceId_ << ", ret: " << ret
-                                                         << ", dataSize: " << rankIdData.size());
-        return SM_ERROR;
-    }
-
     std::lock_guard<std::mutex> guard(entryMutex_);
-    SM_VALIDATE_RETURN(entryIdx_ < HYBM_ENTITY_ID_SEGMENT_SIZE,
-                       "invalid id: " << entryIdx_ << " valid range: [0, " << HYBM_ENTITY_ID_SEGMENT_SIZE << ")",
-                       SM_INVALID_PARAM);
-
     /* create new trans entry */
-    auto tmpEntry = SmMakeRef<SmemTransEntry>(config, name, rank, entryIdx_, confStore);
+    auto tmpEntry = SmMakeRef<SmemTransEntry>(config);
     SM_ASSERT_RETURN(tmpEntry != nullptr, SM_NEW_OBJECT_FAILED);
-
-    /* add into set and map */
 
     ptr2EntryMap_.emplace(reinterpret_cast<uintptr_t>(tmpEntry.Get()), tmpEntry);
 
     /* assign out object ptr */
     entry = tmpEntry;
-    SM_LOG_TRACE("create new smem trans entry success. url:" << name << " rank:" << rank << " server:" << storeUrl
-                                                             << " ptr:0x" << std::hex << entry.Get()
-                                                             << " id:" << entryIdx_);
-    entryIdx_++;
+    SM_LOG_TRACE("create new smem trans entry success. url:" << config.url << " ptr:0x" << std::hex << entry.Get());
+    return SM_OK;
+}
+
+Result SmemTransEntryManager::AllocEntityId(uint32_t &entityId)
+{
+    std::lock_guard<std::mutex> guard(entryMutex_);
+    // hybm's MemEntityFactory dedups engines by entity id process-wide, so the id must be
+    // allocated process-locally; the segment size bounds the ids of one auto-ranked rank.
+    SM_VALIDATE_RETURN(entryIdx_ < HYBM_ENTITY_ID_SEGMENT_SIZE,
+                       "invalid id: " << entryIdx_ << " valid range: [0, " << HYBM_ENTITY_ID_SEGMENT_SIZE << ")",
+                       SM_INVALID_PARAM);
+    entityId = entryIdx_++;
     return SM_OK;
 }
 

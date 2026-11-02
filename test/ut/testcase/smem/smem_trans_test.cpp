@@ -10,8 +10,12 @@
 * See the Mulan PSL v2 for more details.
 */
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <cerrno>
+#include <cstdio>
 #include <gtest/gtest.h>
 #include <mockcpp/mockcpp.hpp>
 #include <algorithm>
@@ -34,97 +38,6 @@
 #undef private
 #include "hybm_va_manager.h"
 
-namespace {
-struct TransRankOperation {
-    std::string operation;
-    uint32_t rank;
-};
-
-std::vector<TransRankOperation> g_transRankOperations;
-int32_t g_transRemoveResult = SMEM_OK;
-int32_t g_transImportResult = SMEM_OK;
-
-template<typename T>
-static void AppendTransBytes(std::vector<uint8_t> &output, const T &value)
-{
-    const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
-    output.insert(output.end(), bytes, bytes + sizeof(value));
-}
-
-static void AppendTransRaw(std::vector<uint8_t> &output, const void *value, size_t size)
-{
-    if (size == 0U) {
-        return;
-    }
-    const auto *bytes = reinterpret_cast<const uint8_t *>(value);
-    output.insert(output.end(), bytes, bytes + size);
-}
-
-static std::vector<uint8_t> MakeTransEntityBaseInfo(uint32_t hybmRank, smem_trans_role_t role, uint32_t pid = 0)
-{
-    ock::mf::EntityExportInfo exported{};
-    exported.rankId = hybmRank;
-    exported.role = static_cast<uint16_t>(role == SMEM_TRANS_SENDER ? HYBM_ROLE_SENDER : HYBM_ROLE_RECEIVER);
-
-    std::vector<uint8_t> desc;
-    AppendTransBytes(desc, exported.magic);
-    AppendTransBytes(desc, exported.version);
-    AppendTransBytes(desc, exported.rankId);
-    AppendTransBytes(desc, exported.role);
-    AppendTransBytes(desc, exported.reserved);
-    AppendTransRaw(desc, exported.nic, sizeof(exported.nic));
-    AppendTransRaw(desc, exported.tag, sizeof(exported.tag));
-    AppendTransRaw(desc, exported.transportPrivateData.ip, sizeof(exported.transportPrivateData.ip));
-    const uint32_t keyWordCount = static_cast<uint32_t>(exported.transportPrivateData.key.WordCount());
-    AppendTransBytes(desc, keyWordCount);
-    AppendTransRaw(desc, exported.transportPrivateData.key.ByteData(), exported.transportPrivateData.key.ByteSize());
-    ock::mf::HbmExportDeviceInfo segment{};
-    segment.rankId = hybmRank;
-    segment.pid = pid;
-    AppendTransRaw(desc, &segment, sizeof(segment));
-
-    ock::smem::SmemTransExchangeInfo exchange{};
-    exchange.u.session.address.type = ock::mf::IpV4;
-    exchange.u.session.address.ip.ipv4.s_addr = htonl(0x7f000001U);
-    exchange.u.session.port = 5321;
-    exchange.u.session.reserved = static_cast<uint16_t>(role);
-    exchange.hybmInfo.descLen = static_cast<uint32_t>(desc.size());
-
-    std::vector<uint8_t> output;
-    AppendTransRaw(output, &exchange.u, sizeof(exchange.u));
-    AppendTransBytes(output, exchange.hybmInfo.descLen);
-    output.insert(output.end(), desc.begin(), desc.end());
-    return output;
-}
-
-static int32_t CaptureTransImport(hybm_entity_t, const hybm_exchange_info infos[], uint32_t count, void *[], uint32_t)
-{
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t rank = 0;
-        if (infos[i].descLen >= sizeof(uint64_t) * 2 + sizeof(rank)) {
-            std::memcpy(&rank, infos[i].desc + sizeof(uint64_t) * 2, sizeof(rank));
-        }
-        g_transRankOperations.push_back({"import", rank});
-    }
-    return g_transImportResult;
-}
-
-static int32_t CaptureTransRemove(hybm_entity_t, uint32_t rank, uint32_t)
-{
-    g_transRankOperations.push_back({"remove", rank});
-    return g_transRemoveResult;
-}
-
-struct TransFakeEntityGuard {
-    explicit TransFakeEntityGuard(ock::smem::SmemTransEntry &entry) : entry_(entry) {}
-    ~TransFakeEntityGuard()
-    {
-        entry_.entity_ = nullptr;
-    }
-    ock::smem::SmemTransEntry &entry_;
-};
-} // namespace
-
 #define MOCKER_CPP(api, TT) MOCKCPP_NS::mockAPI(#api, reinterpret_cast<TT>(api))
 
 using namespace ock::smem;
@@ -135,7 +48,6 @@ const char STORE_URL[] = "tcp://127.0.0.1:5432";
 const char UNIQUE_ID[] = "127.0.0.1:5321";
 const char STORE_URL_IPV6[] = "tcp://[::1]:5432";
 const char UNIQUE_IPV6_ID[] = "[::1]:5321";
-const uint32_t TRANS_TEST_WAIT_TIME = 1; // 1s
 constexpr size_t REGISTER_MEM_ELEM_COUNT = 10;
 constexpr int MAX_TEST_ATTEMPTS = 10;
 constexpr int TRANS_RETRY_COUNT = 120;
@@ -153,6 +65,135 @@ const smem_trans_config_t g_trans_options = {SMEM_TRANS_SENDER, SMEM_DEFAUT_WAIT
 const uint8_t MASK_MOCK_VAL = 3;    // BIT_LOCAL_HOST | BIT_GLOBAL_HOST → H2GH 方向（host transport 数据面）
 constexpr int DUMMY_MEM_VALUE = 42; // dummy address value for deregister tests
 constexpr int TRANS_SYNC_WAIT_MS = 500; // sleep for cross-process sync
+// 单次尝试内等待对端就绪的上限：一次失败的 write/submit 内部会按 store 连接重试并阻塞数十秒，
+// 只靠重试次数（TRANS_RETRY_COUNT）兜底会把失败尝试拖到几十分钟，故叠加墙钟上限
+constexpr int TRANS_PEER_WAIT_TIMEOUT_MS = 30000;
+// 父进程等待两个子 rank 的上限：超时强杀并回收，保证用例有界，且不残留占用固定端口的子进程
+constexpr int TRANS_RANK_EXIT_TIMEOUT_MS = 60000;
+constexpr int TRANS_RANK_WAIT_POLL_MS = 20;
+
+// Build a transfer config for the current API (config carries the instance url; the
+// per-instance config store server is created internally by smem_trans_create).
+static smem_trans_config_t MakeTransConfig(smem_trans_role_t role, const char *url, uint32_t deviceId = 0,
+                                           uint32_t dataOpType = 0)
+{
+    smem_trans_config_t config;
+    (void)smem_trans_config_init(&config);
+    config.role = role;
+    config.initTimeout = SMEM_DEFAUT_WAIT_TIME;
+    config.deviceId = deviceId;
+    config.dataOpType = static_cast<smem_bm_data_op_type>(dataOpType);
+    if (url != nullptr) {
+        (void)snprintf(config.url, sizeof(config.url), "%s", url);
+    }
+    return config;
+}
+
+// Wait for a one-byte pipe signal with a wall-clock bound (poll based, so a peer that exits without
+// signalling is detected through EOF instead of blocking forever).
+// Returns 1 when the expected byte arrived, 0 when the peer closed the pipe, -1 on timeout/error.
+static int WaitPipeSignal(int fd, char expected, uint32_t timeoutMs)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return -1;
+        }
+        auto remainMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        struct pollfd pfd = {fd, POLLIN, 0};
+        int rc = poll(&pfd, 1, static_cast<int>(remainMs));
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (rc == 0) {
+            return -1;
+        }
+        char byte = 0;
+        auto n = read(fd, &byte, 1);
+        if (n == 1) {
+            return (byte == expected) ? 1 : 0;
+        }
+        if (n == 0) {
+            return 0; // 对端已退出
+        }
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+}
+
+// Wait for the two forked ranks of one attempt with a wall-clock bound: as soon as any rank exits
+// abnormally the other one is killed (it would otherwise keep waiting for a dead peer), and if the
+// deadline expires both are killed and reaped. Returns true only when both ranks exited 0 in time.
+// exitCodes carries each rank's exit status (-1 when signalled or killed after the deadline).
+static bool WaitRanksForAttempt(const pid_t *pids, uint32_t rankSize, uint32_t timeoutMs, std::array<int, 2> &exitCodes)
+{
+    for (auto &code : exitCodes) {
+        code = -1;
+    }
+    std::vector<bool> reaped(rankSize, false);
+    uint32_t reapedCount = 0;
+    bool allZero = true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (reapedCount < rankSize) {
+        for (uint32_t i = 0; i < rankSize; ++i) {
+            if (reaped[i]) {
+                continue;
+            }
+            int status = 0;
+            if (waitpid(pids[i], &status, WNOHANG) != pids[i]) {
+                continue;
+            }
+            reaped[i] = true;
+            ++reapedCount;
+            if (WIFEXITED(status)) {
+                exitCodes[i] = WEXITSTATUS(status);
+            }
+            if (exitCodes[i] != 0) {
+                allZero = false;
+            }
+        }
+        if (!allZero || reapedCount == rankSize) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            allZero = false;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(TRANS_RANK_WAIT_POLL_MS));
+    }
+    if (reapedCount < rankSize) {
+        for (uint32_t i = 0; i < rankSize; ++i) {
+            if (reaped[i]) {
+                continue;
+            }
+            int status = 0;
+            kill(pids[i], SIGKILL);
+            waitpid(pids[i], &status, 0);
+            reaped[i] = true;
+            exitCodes[i] = -1;
+            // 强杀避免残留子进程继续占用固定端口（否则会污染后续尝试与后续用例）
+            std::cout << "[trans] rank " << i << " force killed, not exited within " << timeoutMs << " ms" << std::endl;
+        }
+        allZero = false;
+    }
+    return allZero;
+}
+
+// The host transport (HCOM/HOST_TCP) derives its data-plane port from a process-local entity id
+// (11000 + entityId), so co-located trans processes would otherwise bind the same port. Reserve the
+// ids belonging to the lower ranks so every rank's two entities get disjoint ports.
+static void ReserveRankEntityIds(uint32_t rank)
+{
+    for (uint32_t skip = 0; skip < rank * 2U; ++skip) {
+        uint32_t skippedId = 0;
+        (void)SmemTransEntryManager::Instance().AllocEntityId(skippedId);
+    }
+}
 
 class SmemTransTest : public testing::Test {
 public:
@@ -166,10 +207,7 @@ void SmemTransTest::SetUpTestCase() {}
 
 void SmemTransTest::TearDownTestCase() {}
 
-void SmemTransTest::SetUp()
-{
-    g_transImportResult = SMEM_OK;
-}
+void SmemTransTest::SetUp() {}
 
 void SmemTransTest::TearDown()
 {
@@ -203,12 +241,12 @@ TEST_F(SmemTransTest, smem_trans_create_success)
             _exit(1u);
         }
 
-        ret = smem_trans_init(&g_trans_options);
+        ret = smem_trans_init(0, 0);
         if (ret != 0) {
             _exit(2u);
         }
 
-        auto handle = smem_trans_create(STORE_URL, UNIQUE_ID, &g_trans_options);
+        auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_ID), 0);
         if (handle == nullptr) {
             _exit(3u);
         }
@@ -240,12 +278,12 @@ TEST_F(SmemTransTest, smem_trans_create_success_ipv6)
             exit(1);
         }
 
-        ret = smem_trans_init(&g_trans_options);
+        ret = smem_trans_init(0, 0);
         if (ret != 0) {
             exit(2);
         }
 
-        auto handle = smem_trans_create(STORE_URL_IPV6, UNIQUE_IPV6_ID, &g_trans_options);
+        auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_IPV6_ID), 0);
         if (handle == nullptr) {
             exit(3);
         }
@@ -266,24 +304,17 @@ TEST_F(SmemTransTest, smem_trans_create_success_ipv6)
 TEST_F(SmemTransTest, smem_trans_create_failed_invalid_param)
 {
     // not initialized
-    EXPECT_EQ(smem_trans_create(nullptr, UNIQUE_ID, &g_trans_options), nullptr);
+    smem_trans_config_t validCfg = MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_ID);
+    EXPECT_EQ(smem_trans_create(&validCfg, 0), nullptr);
 
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, 0);
 
-    // storeUrl == nullptr
-    EXPECT_EQ(smem_trans_create(nullptr, UNIQUE_ID, &g_trans_options), nullptr);
-    // uniqueId == nullptr
-    EXPECT_EQ(smem_trans_create(STORE_URL, nullptr, &g_trans_options), nullptr);
     // config == nullptr
-    EXPECT_EQ(smem_trans_create(STORE_URL, UNIQUE_ID, nullptr), nullptr);
-
-    // storeUrl or uniqueId is empty
-    const char STORE_URL_TEST1[] = "";
-    const char UNIQUE_ID_TEST[] = "";
-    EXPECT_EQ(smem_trans_create(STORE_URL_TEST1, UNIQUE_ID, &g_trans_options), nullptr);
-    EXPECT_EQ(smem_trans_create(STORE_URL, UNIQUE_ID_TEST, &g_trans_options), nullptr);
-    EXPECT_EQ(smem_trans_create(STORE_URL_IPV6, UNIQUE_ID_TEST, &g_trans_options), nullptr);
+    EXPECT_EQ(smem_trans_create(nullptr, 0), nullptr);
+    // config->url is empty
+    smem_trans_config_t emptyCfg = MakeTransConfig(SMEM_TRANS_SENDER, nullptr);
+    EXPECT_EQ(smem_trans_create(&emptyCfg, 0), nullptr);
 
     smem_trans_uninit(0);
 }
@@ -301,10 +332,10 @@ TEST_F(SmemTransTest, smem_trans_register_mem_failed_invalid_param)
         // first create server
         smem_set_conf_store_tls(false, nullptr, 0);
         smem_create_config_store(STORE_URL, SMEM_STORE_SKIP_RECOVER);
-        int ret = smem_trans_init(&g_trans_options);
+        int ret = smem_trans_init(0, 0);
         EXPECT_EQ(ret, 0);
         // client connect to server when initializing
-        auto handle = smem_trans_create(STORE_URL, UNIQUE_ID, &g_trans_options);
+        auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_ID), 0);
 
         // handle = nullptr
         ret = smem_trans_register_mem(nullptr, address, size, 0);
@@ -352,10 +383,10 @@ TEST_F(SmemTransTest, smem_trans_register_mem_failed_invalid_param_ipv6)
         // first create server
         smem_set_conf_store_tls(false, nullptr, 0);
         smem_create_config_store(STORE_URL_IPV6, SMEM_STORE_SKIP_RECOVER);
-        int ret = smem_trans_init(&g_trans_options);
+        int ret = smem_trans_init(0, 0);
         EXPECT_EQ(ret, 0);
         // client connect to server when initializing
-        auto handle = smem_trans_create(STORE_URL_IPV6, UNIQUE_IPV6_ID, &g_trans_options);
+        auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_IPV6_ID), 0);
 
         // handle = nullptr
         ret = smem_trans_register_mem(nullptr, address, size, 0);
@@ -404,7 +435,7 @@ TEST_F(SmemTransTest, smem_trans_register_mem_failed_not_initialized)
 TEST_F(SmemTransTest, smem_trans_register_mem_invalid_handle_nonnull)
 {
     smem_trans_config_t config = g_trans_options;
-    ASSERT_EQ(smem_trans_init(&config), 0);
+    ASSERT_EQ(smem_trans_init(config.deviceId, 0), 0);
 
     int *address = new int[REGISTER_MEM_ELEM_COUNT];
     size_t size = REGISTER_MEM_ELEM_COUNT * sizeof(int);
@@ -430,11 +461,11 @@ TEST_F(SmemTransTest, smem_trans_register_mem_duplicate_address)
 
         smem_set_conf_store_tls(false, nullptr, 0);
         smem_create_config_store(STORE_URL, SMEM_STORE_SKIP_RECOVER);
-        int ret = smem_trans_init(&g_trans_options);
+        int ret = smem_trans_init(0, 0);
         if (ret != 0) {
             _exit(1);
         }
-        auto handle = smem_trans_create(STORE_URL, UNIQUE_ID, &g_trans_options);
+        auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_ID), 0);
         if (handle == nullptr) {
             _exit(2);
         }
@@ -461,15 +492,41 @@ TEST_F(SmemTransTest, smem_trans_register_mem_duplicate_address)
 
 TEST_F(SmemTransTest, smem_trans_deregister_mem_success)
 {
-    int ret = smem_trans_init(&g_trans_options);
-    EXPECT_EQ(ret, SM_OK);
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1);
 
-    auto handle = reinterpret_cast<smem_trans_t>(0x12345678);
-    int dummy = 42;
+    if (pid == 0) {
+        int *address = new int[REGISTER_MEM_ELEM_COUNT];
+        size_t size = REGISTER_MEM_ELEM_COUNT * sizeof(int);
 
-    EXPECT_EQ(smem_trans_deregister_mem(handle, &dummy), SM_OK);
+        smem_set_conf_store_tls(false, nullptr, 0);
+        smem_create_config_store(STORE_URL, SMEM_STORE_SKIP_RECOVER);
+        int ret = smem_trans_init(0, 0);
+        if (ret != 0) {
+            _exit(1);
+        }
+        auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_ID), 0);
+        if (handle == nullptr) {
+            _exit(2);
+        }
+        ret = smem_trans_register_mem(handle, address, size, 0);
+        if (ret != SM_OK) {
+            _exit(3);
+        }
+        ret = smem_trans_deregister_mem(handle, address);
+        if (ret != SM_OK) {
+            _exit(4);
+        }
+        delete[] address;
+        smem_trans_destroy(handle, 0);
+        smem_trans_uninit(0);
+        _exit(0);
+    }
 
-    smem_trans_uninit(0);
+    int status;
+    ASSERT_NE(waitpid(pid, &status, 0), -1);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0) << "Child exited with error code: " << WEXITSTATUS(status);
 }
 
 TEST_F(SmemTransTest, smem_trans_deregister_mem_failed_not_initialized)
@@ -482,7 +539,7 @@ TEST_F(SmemTransTest, smem_trans_deregister_mem_failed_not_initialized)
 
 TEST_F(SmemTransTest, smem_trans_deregister_mem_failed_null_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     int dummy = 42;
@@ -494,7 +551,7 @@ TEST_F(SmemTransTest, smem_trans_deregister_mem_failed_null_handle)
 
 TEST_F(SmemTransTest, smem_trans_deregister_mem_failed_null_address)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0x12345678);
@@ -516,7 +573,7 @@ TEST_F(SmemTransTest, smem_trans_read_failed_not_initialized)
 
 TEST_F(SmemTransTest, smem_trans_read_failed_null_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     char local_buf[1];
@@ -530,7 +587,7 @@ TEST_F(SmemTransTest, smem_trans_read_failed_null_handle)
 
 TEST_F(SmemTransTest, smem_trans_read_failed_null_remote_unique_id)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     char local_buf[1];
@@ -544,7 +601,7 @@ TEST_F(SmemTransTest, smem_trans_read_failed_null_remote_unique_id)
 
 TEST_F(SmemTransTest, smem_trans_read_failed_get_entry_failed)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto invalid_handle = reinterpret_cast<smem_trans_t>(0xDEADBEEF);
@@ -571,7 +628,7 @@ TEST_F(SmemTransTest, smem_trans_batch_read_failed_not_initialized)
 
 TEST_F(SmemTransTest, smem_trans_batch_read_failed_null_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     void *local_addrs[1] = {nullptr};
@@ -586,7 +643,7 @@ TEST_F(SmemTransTest, smem_trans_batch_read_failed_null_handle)
 
 TEST_F(SmemTransTest, smem_trans_batch_read_failed_null_remote_unique_id)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0x2000);
@@ -601,7 +658,7 @@ TEST_F(SmemTransTest, smem_trans_batch_read_failed_null_remote_unique_id)
 
 TEST_F(SmemTransTest, smem_trans_batch_read_failed_get_entry_failed)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto invalid_handle = reinterpret_cast<smem_trans_t>(0xBADBAD);
@@ -628,7 +685,7 @@ TEST_F(SmemTransTest, smem_trans_write_submit_failed_not_initialized)
 
 TEST_F(SmemTransTest, smem_trans_write_submit_failed_null_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     const char data[] = "test";
@@ -643,7 +700,7 @@ TEST_F(SmemTransTest, smem_trans_write_submit_failed_null_handle)
 
 TEST_F(SmemTransTest, smem_trans_write_submit_failed_null_remote_unique_id)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0x3000);
@@ -658,7 +715,7 @@ TEST_F(SmemTransTest, smem_trans_write_submit_failed_null_remote_unique_id)
 
 TEST_F(SmemTransTest, smem_trans_write_submit_failed_null_stream)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0x3000);
@@ -673,7 +730,7 @@ TEST_F(SmemTransTest, smem_trans_write_submit_failed_null_stream)
 
 TEST_F(SmemTransTest, smem_trans_write_submit_failed_get_entry_failed)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto invalid_handle = reinterpret_cast<smem_trans_t>(0xDEADCAFE);
@@ -701,7 +758,7 @@ TEST_F(SmemTransTest, smem_trans_write_failed_not_initialized)
 
 TEST_F(SmemTransTest, smem_trans_write_failed_null_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     ASSERT_EQ(ret, SM_OK);
 
     const char data[] = "test";
@@ -716,7 +773,7 @@ TEST_F(SmemTransTest, smem_trans_write_failed_null_handle)
 
 TEST_F(SmemTransTest, smem_trans_write_failed_null_remote_unique_id)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     ASSERT_EQ(ret, SM_OK);
 
     const char data[] = "test";
@@ -731,7 +788,7 @@ TEST_F(SmemTransTest, smem_trans_write_failed_null_remote_unique_id)
 
 TEST_F(SmemTransTest, smem_trans_write_failed_get_entry_failed)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     ASSERT_EQ(ret, SM_OK);
 
     const char data[] = "test";
@@ -758,7 +815,7 @@ TEST_F(SmemTransTest, smem_trans_read_submit_failed_not_initialized)
 
 TEST_F(SmemTransTest, smem_trans_read_submit_failed_null_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     char local[10] = {0};
@@ -773,7 +830,7 @@ TEST_F(SmemTransTest, smem_trans_read_submit_failed_null_handle)
 
 TEST_F(SmemTransTest, smem_trans_read_submit_failed_null_remote_unique_id)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0x4000);
@@ -788,7 +845,7 @@ TEST_F(SmemTransTest, smem_trans_read_submit_failed_null_remote_unique_id)
 
 TEST_F(SmemTransTest, smem_trans_read_submit_failed_null_stream)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0x4000);
@@ -803,7 +860,7 @@ TEST_F(SmemTransTest, smem_trans_read_submit_failed_null_stream)
 
 TEST_F(SmemTransTest, smem_trans_read_submit_invalid_nonnull_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     char local[10] = {0};
@@ -835,7 +892,7 @@ TEST_F(SmemTransTest, smem_trans_batch_write_submit_failed_not_initialized)
 
 TEST_F(SmemTransTest, smem_trans_batch_write_submit_failed_null_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     const void *localAddrs[1] = {nullptr};
@@ -852,7 +909,7 @@ TEST_F(SmemTransTest, smem_trans_batch_write_submit_failed_null_handle)
 
 TEST_F(SmemTransTest, smem_trans_batch_write_submit_failed_null_remote_unique_id)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0x6000);
@@ -869,7 +926,7 @@ TEST_F(SmemTransTest, smem_trans_batch_write_submit_failed_null_remote_unique_id
 
 TEST_F(SmemTransTest, smem_trans_batch_write_submit_failed_null_stream)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0x6000);
@@ -886,7 +943,7 @@ TEST_F(SmemTransTest, smem_trans_batch_write_submit_failed_null_stream)
 
 TEST_F(SmemTransTest, smem_trans_batch_write_submit_invalid_nonnull_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     const size_t batchSize = 2;
@@ -927,7 +984,7 @@ TEST_F(SmemTransTest, smem_trans_batch_read_submit_failed_not_initialized)
 
 TEST_F(SmemTransTest, smem_trans_batch_read_submit_failed_null_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     ASSERT_EQ(ret, SM_OK);
 
     void *localAddrs[1] = {nullptr};
@@ -944,7 +1001,7 @@ TEST_F(SmemTransTest, smem_trans_batch_read_submit_failed_null_handle)
 
 TEST_F(SmemTransTest, smem_trans_batch_read_submit_failed_null_remote_unique_id)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     ASSERT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0xA001);
@@ -961,7 +1018,7 @@ TEST_F(SmemTransTest, smem_trans_batch_read_submit_failed_null_remote_unique_id)
 
 TEST_F(SmemTransTest, smem_trans_batch_read_submit_failed_null_stream)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     ASSERT_EQ(ret, SM_OK);
 
     auto handle = reinterpret_cast<smem_trans_t>(0xA002);
@@ -978,7 +1035,7 @@ TEST_F(SmemTransTest, smem_trans_batch_read_submit_failed_null_stream)
 
 TEST_F(SmemTransTest, smem_trans_batch_read_submit_invalid_nonnull_handle)
 {
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, SM_OK);
 
     const uint32_t batchSize = 2;
@@ -1004,96 +1061,6 @@ TEST_F(SmemTransTest, smem_trans_batch_read_submit_invalid_nonnull_handle)
     smem_trans_uninit(0);
 }
 
-TEST_F(SmemTransTest, smem_trans_batch_quant_write_failed_not_initialized)
-{
-    smem_trans_quant_copy_param_t params = {};
-    params.remoteUniqueId = "remote";
-    auto handle = reinterpret_cast<smem_trans_t>(0xC000);
-
-    EXPECT_EQ(smem_trans_batch_quant_write(handle, &params), SM_INVALID_PARAM);
-}
-
-TEST_F(SmemTransTest, smem_trans_batch_quant_write_failed_null_handle)
-{
-    int ret = smem_trans_init(&g_trans_options);
-    ASSERT_EQ(ret, SM_OK);
-
-    smem_trans_quant_copy_param_t params = {};
-    params.remoteUniqueId = "remote";
-
-    EXPECT_EQ(smem_trans_batch_quant_write(nullptr, &params), SM_INVALID_PARAM);
-
-    smem_trans_uninit(0);
-}
-
-TEST_F(SmemTransTest, smem_trans_batch_quant_write_failed_null_params)
-{
-    int ret = smem_trans_init(&g_trans_options);
-    ASSERT_EQ(ret, SM_OK);
-
-    auto handle = reinterpret_cast<smem_trans_t>(0xC001);
-
-    EXPECT_EQ(smem_trans_batch_quant_write(handle, nullptr), SM_INVALID_PARAM);
-
-    smem_trans_uninit(0);
-}
-
-TEST_F(SmemTransTest, smem_trans_batch_quant_write_failed_null_remote_unique_id)
-{
-    int ret = smem_trans_init(&g_trans_options);
-    ASSERT_EQ(ret, SM_OK);
-
-    smem_trans_quant_copy_param_t params = {};
-    params.remoteUniqueId = nullptr;
-    auto handle = reinterpret_cast<smem_trans_t>(0xC002);
-
-    EXPECT_EQ(smem_trans_batch_quant_write(handle, &params), SM_INVALID_PARAM);
-
-    smem_trans_uninit(0);
-}
-
-TEST_F(SmemTransTest, smem_trans_batch_quant_write_invalid_nonnull_handle)
-{
-    int ret = smem_trans_init(&g_trans_options);
-    EXPECT_EQ(ret, SM_OK);
-
-    const uint32_t batchSize = 1;
-
-    float local_data[16] = {1.0f, 2.0f, 3.0f, 4.0f};
-    int8_t remote_data[16] = {0};
-
-    void *local_addr_array[1] = {local_data};
-    void *remote_addr_array[1] = {remote_data};
-
-    size_t data_sizes[1] = {sizeof(local_data)};
-
-    float scale_val = 1.25f;
-    float offset_val = 0.0f;
-    float *scale_ptr_array[1] = {&scale_val};
-    float *offset_ptr_array[1] = {&offset_val};
-
-    smem_trans_quant_copy_param_t params{};
-    params.remoteUniqueId = "127.0.0.1:7777";
-    params.localAddrs = local_addr_array;
-    params.remoteAddrs = remote_addr_array;
-    params.dataSizes = data_sizes;
-    params.scale = scale_ptr_array;
-    params.offset = offset_ptr_array;
-    params.batchSize = batchSize;
-    params.unitNum = 16;
-    params.stream = nullptr;
-    params.inputType = 1;
-    params.flags = 0;
-
-    smem_trans_t invalid_handle = reinterpret_cast<smem_trans_t>(0xC0FFEE);
-
-    int32_t result = smem_trans_batch_quant_write(invalid_handle, &params);
-
-    EXPECT_NE(result, SM_OK) << "Expected failure due to invalid (non-null) handle";
-
-    smem_trans_uninit(0);
-}
-
 TEST_F(SmemTransTest, smem_trans_read_write)
 {
     uint32_t rankSize = 2;
@@ -1104,24 +1071,24 @@ TEST_F(SmemTransTest, smem_trans_read_write)
     smem_trans_config_t recv_trans_options = {SMEM_TRANS_RECEIVER, SMEM_DEFAUT_WAIT_TIME, 1, 0};
 
     auto func = [](uint32_t rank, uint32_t rankCount, smem_trans_config_t trans_options, std::vector<int *> addrPtrs,
-                   size_t capacities, const std::array<const char *, 2> unique_ids) {
-        if (rank == 1) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
+                   size_t capacities, const std::array<const char *, 2> unique_ids, const int *syncPipe) {
         trans_options.dataOpType = SMEMB_DATA_OP_HOST_TCP;
         auto classifyAddressMaskPtr = static_cast<ClassifyAddressMaskMemberFn>(&HybmVaManager::ClassifyAddressMask);
         MOCKER_CPP(classifyAddressMaskPtr, uint8_t(*)(HybmVaManager *, const uint64_t))
             .stubs()
             .will(returnValue(MASK_MOCK_VAL));
-        int ret = smem_trans_init(&trans_options);
+        int ret = smem_trans_init(trans_options.deviceId, 0);
         if (ret != 0) {
             _exit(1);
         }
+        ReserveRankEntityIds(rank);
         void *handle = nullptr;
         constexpr int createMaxRetry = 300;
         constexpr int retryIntervalMs = TRANS_RETRY_INTERVAL_MS;
         for (int retry = 0; retry < createMaxRetry; ++retry) {
-            handle = smem_trans_create(STORE_URL, unique_ids[rank], &trans_options);
+            handle = smem_trans_create(
+                &MakeTransConfig(trans_options.role, unique_ids[rank], trans_options.deviceId, SMEMB_DATA_OP_HOST_TCP),
+                0);
             if (handle != nullptr) {
                 break;
             }
@@ -1136,11 +1103,33 @@ TEST_F(SmemTransTest, smem_trans_read_write)
             _exit(3);
         }
 
+        // trans 仅支持「先注册内存再 join」：接收端先发布已注册切片，发送端在其完成后再建链（join），
+        // 这样对端切片由 join 携带，而不依赖 join 之后被忽略的 ADD_SLICES 广播。
+        if (rank == 1) {
+            char done = 'r';
+            (void)write(syncPipe[1], &done, 1);
+        }
+        if (rank == 0) {
+            char done = 0;
+            ssize_t n = 0;
+            do {
+                n = read(syncPipe[0], &done, 1);
+            } while (n < 0 && errno == EINTR);
+            if (n != 1) {
+                _exit(7);
+            }
+            // 留出时间让 server 持久化接收端切片，再发起 join
+            std::this_thread::sleep_for(std::chrono::milliseconds(TRANS_SYNC_WAIT_MS));
+        }
+
         if (rank == 0) {
             // Receiver registration and session publication are asynchronous across processes.
             // Retry briefly to avoid transient "session not found" flakiness.
+            // 每次失败内部会按 store 连接阻塞重试数十秒，故以墙钟上限兜底，避免失败尝试拖到几十分钟
             constexpr int maxRetry = 120;
-            for (int retry = 0; retry < maxRetry; ++retry) {
+            const auto peerDeadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(TRANS_PEER_WAIT_TIMEOUT_MS);
+            for (int retry = 0; retry < maxRetry && std::chrono::steady_clock::now() < peerDeadline; ++retry) {
                 ret = smem_trans_write(handle, addrPtrs[0], unique_ids[1], addrPtrs[1], capacities, 0);
                 if (ret == SM_OK) {
                     break;
@@ -1150,12 +1139,20 @@ TEST_F(SmemTransTest, smem_trans_read_write)
             if (ret != SM_OK) {
                 _exit(4);
             }
+            // 通知接收端传输已完成（rank0 提前失败时写端随进程退出关闭，接收端读到 EOF 同样能退出）
+            char fin = 'd';
+            (void)write(syncPipe[3], &fin, 1);
         }
         if (rank == 1) {
             // The receiver must stay registered while the sender's write retries run: the HOST_TCP
             // data plane writes over a live hcom channel, which is torn down as soon as the receiver
             // deregisters and exits, making every sender retry fail with "rankId is not connect".
-            std::this_thread::sleep_for(std::chrono::seconds(TRANS_TEST_WAIT_TIME));
+            // 故改为等发送端的完成信号（固定 sleep 覆盖不到发送端建链/重试的耗时）；rank0 提前
+            // 失败时其写端关闭，这里同样能通过 EOF 及时退出，不会把用例拖成假挂死。
+            auto sig = WaitPipeSignal(syncPipe[2], 'd', TRANS_PEER_WAIT_TIMEOUT_MS);
+            if (sig <= 0) {
+                std::cout << "[trans] rank 1 wait peer done: sig=" << sig << std::endl;
+            }
         }
 
         ret = smem_trans_deregister_mem(handle, addrPtrs[rank]);
@@ -1174,19 +1171,30 @@ TEST_F(SmemTransTest, smem_trans_read_write)
     bool testSuccess = false;
     constexpr int maxAttempts = MAX_TEST_ATTEMPTS;
     for (int attempt = 0; attempt < maxAttempts && !testSuccess; ++attempt) {
+        // syncPipe[0..1]: 接收端注册完成 → 发送端；syncPipe[2..3]: 发送端传输完成 → 接收端
+        int syncPipe[4] = {-1, -1, -1, -1};
+        if (pipe(&syncPipe[0]) != 0 || pipe(&syncPipe[2]) != 0) {
+            continue;
+        }
         pid_t pids[rankSize] = {0};
-        bool allExitedZero = true;
         bool needKillOthers = false;
         uint32_t maxProcess = rankSize;
         for (uint32_t i = 0; i < rankSize; ++i) {
             pids[i] = fork();
             if (pids[i] == -1) {
                 maxProcess = i;
-                allExitedZero = false;
                 needKillOthers = true;
                 break;
             }
             if (pids[i] == 0) {
+                (void)prctl(PR_SET_PDEATHSIG, SIGKILL); // 父进程被强杀时不残留占用固定端口的子进程
+                if (i == 0) {
+                    close(syncPipe[1]); // rank0: 只保留 ready 读端与 done 写端
+                    close(syncPipe[2]);
+                } else {
+                    close(syncPipe[0]); // rank1: 只保留 ready 写端与 done 读端
+                    close(syncPipe[3]);
+                }
                 smem_set_conf_store_tls(false, nullptr, 0);
                 if (i == 0) {
                     int ret = -1;
@@ -1203,10 +1211,14 @@ TEST_F(SmemTransTest, smem_trans_read_write)
                         _exit(STORE_CREATE_FAILED_EXIT_CODE);
                     }
                 }
-                func(i, rankSize, trans_options[i], addrPtrs, capacities, unique_ids);
+                func(i, rankSize, trans_options[i], addrPtrs, capacities, unique_ids, syncPipe);
                 _exit(0);
             }
         }
+        close(syncPipe[0]);
+        close(syncPipe[1]);
+        close(syncPipe[2]);
+        close(syncPipe[3]);
 
         if (needKillOthers) {
             for (uint32_t i = 0; i < maxProcess; ++i) {
@@ -1219,22 +1231,12 @@ TEST_F(SmemTransTest, smem_trans_read_write)
             continue;
         }
 
-        for (uint32_t i = 0; i < rankSize; ++i) {
-            int status = 0;
-            waitpid(pids[i], &status, 0);
-            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                allExitedZero = false;
-                for (uint32_t j = 0; j < rankSize; ++j) {
-                    if (i != j && pids[j] > 0) {
-                        kill(pids[j], SIGKILL);
-                        int killedStatus = 0;
-                        waitpid(pids[j], &killedStatus, 0);
-                    }
-                }
-                break;
-            }
+        std::array<int, 2> exitCodes = {{-1, -1}};
+        testSuccess = WaitRanksForAttempt(pids, rankSize, TRANS_RANK_EXIT_TIMEOUT_MS, exitCodes);
+        if (!testSuccess) {
+            std::cout << "[trans] attempt " << attempt << " failed: rank0 exit=" << exitCodes[0]
+                      << " rank1 exit=" << exitCodes[1] << std::endl;
         }
-        testSuccess = allExitedZero;
     }
     EXPECT_EQ(testSuccess, true);
     delete[] sender_buffer;
@@ -1251,29 +1253,25 @@ TEST_F(SmemTransTest, smem_trans_write_ipv6)
     smem_trans_config_t recv_trans_options = {SMEM_TRANS_RECEIVER, SMEM_DEFAUT_WAIT_TIME, 1, 0};
 
     auto func = [](uint32_t rank, uint32_t rankCount, smem_trans_config_t trans_options, std::vector<int *> addrPtrs,
-                   size_t capacities, const std::array<const char *, 2> unique_ids) {
+                   size_t capacities, const std::array<const char *, 2> unique_ids, const int *syncPipe) {
         trans_options.dataOpType = SMEMB_DATA_OP_HOST_TCP;
         auto classifyAddressMaskPtr = static_cast<ClassifyAddressMaskMemberFn>(&HybmVaManager::ClassifyAddressMask);
         MOCKER_CPP(classifyAddressMaskPtr, uint8_t(*)(HybmVaManager *, const uint64_t))
             .stubs()
             .will(returnValue(MASK_MOCK_VAL));
-        int ret = smem_trans_init(&trans_options);
+        int ret = smem_trans_init(trans_options.deviceId, 0);
         if (ret != 0) {
             _exit(1);
         }
+        ReserveRankEntityIds(rank);
         constexpr int retryIntervalMs = TRANS_RETRY_INTERVAL_MS;
-        if (rank == 1) {
-            // 接收端延后启动：发送端（fork0，store 宿主）先入组并注册，接收端加入时
-            // 服务端下发 ADDWLST/ESTCONN，其注册切片才能广播到发送端。
-            // 延迟放在发送端会使两个子进程生命周期零交叠（接收端注册 1s 后即退出），
-            // 导致发送端写重试全程 "session not found"（ASAN CI 下必现）。
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
         void *handle = nullptr;
         {
             constexpr int createMaxRetry = 120;
             for (int retry = 0; retry < createMaxRetry; ++retry) {
-                handle = smem_trans_create(STORE_URL_IPV6, unique_ids[rank], &trans_options);
+                handle = smem_trans_create(&MakeTransConfig(trans_options.role, unique_ids[rank],
+                                                            trans_options.deviceId, SMEMB_DATA_OP_HOST_TCP),
+                                           0);
                 if (handle != nullptr) {
                     break;
                 }
@@ -1289,9 +1287,30 @@ TEST_F(SmemTransTest, smem_trans_write_ipv6)
             _exit(3);
         }
 
+        // trans 仅支持「先注册内存再 join」：接收端先发布已注册切片，发送端等待后再建链（join），
+        // 对端切片由 join 携带，不依赖 join 之后被忽略的 ADD_SLICES 广播。
+        if (rank == 1) {
+            char done = 'r';
+            (void)write(syncPipe[1], &done, 1);
+        }
         if (rank == 0) {
+            char done = 0;
+            ssize_t n = 0;
+            do {
+                n = read(syncPipe[0], &done, 1);
+            } while (n < 0 && errno == EINTR);
+            if (n != 1) {
+                _exit(7);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(TRANS_SYNC_WAIT_MS));
+        }
+
+        if (rank == 0) {
+            // 失败重试内部可能阻塞数十秒，故叠加墙钟上限，保证失败尝试有界退出
             constexpr int writeMaxRetry = TRANS_RETRY_COUNT;
-            for (int retry = 0; retry < writeMaxRetry; ++retry) {
+            const auto peerDeadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(TRANS_PEER_WAIT_TIMEOUT_MS);
+            for (int retry = 0; retry < writeMaxRetry && std::chrono::steady_clock::now() < peerDeadline; ++retry) {
                 ret = smem_trans_write(handle, addrPtrs[0], unique_ids[1], addrPtrs[1], capacities, 0);
                 if (ret == SM_OK) {
                     break;
@@ -1324,9 +1343,17 @@ TEST_F(SmemTransTest, smem_trans_write_ipv6)
                 _exit(9);
             }
             // Same as above: HOST_TCP submit is synchronous, no stream counter.
+            // 通知接收端传输已完成（rank0 提前失败时写端随进程退出关闭，接收端读到 EOF 同样能退出）
+            char fin = 'd';
+            (void)write(syncPipe[3], &fin, 1);
         }
         if (rank == 1) {
-            std::this_thread::sleep_for(std::chrono::seconds(TRANS_TEST_WAIT_TIME));
+            // 等发送端完成信号再注销（rank0 提前失败时通过 EOF 退出）：固定 sleep 覆盖不到发送端
+            // 建链/重试耗时，接收端过早退出会让发送端重试全部失败
+            auto sig = WaitPipeSignal(syncPipe[2], 'd', TRANS_PEER_WAIT_TIMEOUT_MS);
+            if (sig <= 0) {
+                std::cout << "[trans] rank 1 wait peer done: sig=" << sig << std::endl;
+            }
         }
 
         ret = smem_trans_deregister_mem(handle, addrPtrs[rank]);
@@ -1345,19 +1372,30 @@ TEST_F(SmemTransTest, smem_trans_write_ipv6)
     bool testSuccess = false;
     constexpr int maxAttempts = MAX_TEST_ATTEMPTS;
     for (int attempt = 0; attempt < maxAttempts && !testSuccess; ++attempt) {
+        // syncPipe[0..1]: 接收端注册完成 → 发送端；syncPipe[2..3]: 发送端传输完成 → 接收端
+        int syncPipe[4] = {-1, -1, -1, -1};
+        if (pipe(&syncPipe[0]) != 0 || pipe(&syncPipe[2]) != 0) {
+            continue;
+        }
         pid_t pids[rankSize] = {0};
-        bool allExitedZero = true;
         bool needKillOthers = false;
         uint32_t maxProcess = rankSize;
         for (uint32_t i = 0; i < rankSize; ++i) {
             pids[i] = fork();
             if (pids[i] == -1) {
                 maxProcess = i;
-                allExitedZero = false;
                 needKillOthers = true;
                 break;
             }
             if (pids[i] == 0) {
+                (void)prctl(PR_SET_PDEATHSIG, SIGKILL); // 父进程被强杀时不残留占用固定端口的子进程
+                if (i == 0) {
+                    close(syncPipe[1]); // rank0: 只保留 ready 读端与 done 写端
+                    close(syncPipe[2]);
+                } else {
+                    close(syncPipe[0]); // rank1: 只保留 ready 写端与 done 读端
+                    close(syncPipe[3]);
+                }
                 smem_set_conf_store_tls(false, nullptr, 0);
                 if (i == 0) {
                     int ret = -1;
@@ -1374,10 +1412,15 @@ TEST_F(SmemTransTest, smem_trans_write_ipv6)
                         _exit(STORE_CREATE_RETRY_FAILED_EXIT_CODE);
                     }
                 }
-                func(i, rankSize, trans_options[i], addrPtrs, capacities, unique_ids);
+                func(i, rankSize, trans_options[i], addrPtrs, capacities, unique_ids, syncPipe);
                 _exit(0);
             }
         }
+        close(syncPipe[0]);
+        close(syncPipe[1]);
+        close(syncPipe[2]);
+        close(syncPipe[3]);
+
         if (needKillOthers) {
             for (uint32_t i = 0; i < maxProcess; ++i) {
                 if (pids[i] > 0) {
@@ -1388,22 +1431,12 @@ TEST_F(SmemTransTest, smem_trans_write_ipv6)
             }
             continue;
         }
-        for (uint32_t i = 0; i < rankSize; ++i) {
-            int status = 0;
-            waitpid(pids[i], &status, 0);
-            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                allExitedZero = false;
-                for (uint32_t j = 0; j < rankSize; ++j) {
-                    if (i != j && pids[j] > 0) {
-                        kill(pids[j], SIGKILL);
-                        int killedStatus = 0;
-                        waitpid(pids[j], &killedStatus, 0);
-                    }
-                }
-                break;
-            }
+        std::array<int, 2> exitCodes = {{-1, -1}};
+        testSuccess = WaitRanksForAttempt(pids, rankSize, TRANS_RANK_EXIT_TIMEOUT_MS, exitCodes);
+        if (!testSuccess) {
+            std::cout << "[trans] attempt " << attempt << " failed: rank0 exit=" << exitCodes[0]
+                      << " rank1 exit=" << exitCodes[1] << std::endl;
         }
-        testSuccess = allExitedZero;
     }
     EXPECT_EQ(testSuccess, true);
     delete[] sender_buffer;
@@ -1423,22 +1456,25 @@ TEST_F(SmemTransTest, smem_trans_batch_read_write)
 
     auto func = [](uint32_t rank, uint32_t rankCount, smem_trans_config_t trans_options,
                    std::vector<std::vector<void *>> addrPtrs, std::vector<size_t> capacities,
-                   const std::array<const char *, 2> unique_ids) {
+                   const std::array<const char *, 2> unique_ids, const int *syncPipe) {
         trans_options.dataOpType = SMEMB_DATA_OP_HOST_TCP;
         auto classifyAddressMaskPtr = static_cast<ClassifyAddressMaskMemberFn>(&HybmVaManager::ClassifyAddressMask);
         MOCKER_CPP(classifyAddressMaskPtr, uint8_t(*)(HybmVaManager *, const uint64_t))
             .stubs()
             .will(returnValue(MASK_MOCK_VAL));
-        int ret = smem_trans_init(&trans_options);
+        int ret = smem_trans_init(trans_options.deviceId, 0);
         if (ret != 0) {
             _exit(1);
         }
+        ReserveRankEntityIds(rank);
         void *handle = nullptr;
         {
             constexpr int createMaxRetry = TRANS_RETRY_COUNT;
             constexpr int retryIntervalMs = TRANS_RETRY_INTERVAL_MS;
             for (int retry = 0; retry < createMaxRetry; ++retry) {
-                handle = smem_trans_create(STORE_URL, unique_ids[rank], &trans_options);
+                handle = smem_trans_create(&MakeTransConfig(trans_options.role, unique_ids[rank],
+                                                            trans_options.deviceId, SMEMB_DATA_OP_HOST_TCP),
+                                           0);
                 if (handle != nullptr) {
                     break;
                 }
@@ -1454,11 +1490,32 @@ TEST_F(SmemTransTest, smem_trans_batch_read_write)
             _exit(3);
         }
 
+        // trans 仅支持「先注册内存再 join」：接收端先发布已注册切片，发送端等待后再建链（join），
+        // 对端切片由 join 携带，不依赖 join 之后被忽略的 ADD_SLICES 广播。
+        if (rank == 1) {
+            char done = 'r';
+            (void)write(syncPipe[1], &done, 1);
+        }
+        if (rank == 0) {
+            char done = 0;
+            ssize_t n = 0;
+            do {
+                n = read(syncPipe[0], &done, 1);
+            } while (n < 0 && errno == EINTR);
+            if (n != 1) {
+                _exit(7);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(TRANS_SYNC_WAIT_MS));
+        }
+
         if (rank == 0) {
             const void *srcAddr[] = {addrPtrs[0][0]};
+            // 失败重试内部可能阻塞数十秒，故叠加墙钟上限，保证失败尝试有界退出
             constexpr int writeMaxRetry = TRANS_RETRY_COUNT;
             constexpr int retryIntervalMs = TRANS_RETRY_INTERVAL_MS;
-            for (int retry = 0; retry < writeMaxRetry; ++retry) {
+            const auto peerDeadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(TRANS_PEER_WAIT_TIMEOUT_MS);
+            for (int retry = 0; retry < writeMaxRetry && std::chrono::steady_clock::now() < peerDeadline; ++retry) {
                 ret =
                     smem_trans_batch_write(handle, srcAddr, unique_ids[1], addrPtrs[1].data(), capacities.data(), 1, 0);
                 if (ret == SM_OK) {
@@ -1481,7 +1538,7 @@ TEST_F(SmemTransTest, smem_trans_batch_read_write)
             // through ubs-comm TCP instead and is synchronous, so no async task is
             // ever submitted to an acl stream and the counter stays 0.
 
-            for (int retry = 0; retry < writeMaxRetry; ++retry) {
+            for (int retry = 0; retry < writeMaxRetry && std::chrono::steady_clock::now() < peerDeadline; ++retry) {
                 ret =
                     smem_trans_batch_read(handle, srcAddr, unique_ids[1], addrPtrs[1].data(), capacities.data(), 1, 0);
                 if (ret == SM_OK) {
@@ -1499,9 +1556,17 @@ TEST_F(SmemTransTest, smem_trans_batch_read_write)
                 _exit(6);
             }
             // Same as above: HOST_TCP submit is synchronous, no stream counter.
+            // 通知接收端传输已完成（rank0 提前失败时写端随进程退出关闭，接收端读到 EOF 同样能退出）
+            char fin = 'd';
+            (void)write(syncPipe[3], &fin, 1);
         }
         if (rank == 1) {
-            std::this_thread::sleep_for(std::chrono::seconds(TRANS_TEST_WAIT_TIME));
+            // 等发送端完成信号再注销（rank0 提前失败时通过 EOF 退出）：固定 sleep 覆盖不到发送端
+            // 建链/重试耗时，接收端过早退出会让发送端重试全部失败
+            auto sig = WaitPipeSignal(syncPipe[2], 'd', TRANS_PEER_WAIT_TIMEOUT_MS);
+            if (sig <= 0) {
+                std::cout << "[trans] rank 1 wait peer done: sig=" << sig << std::endl;
+            }
         }
 
         smem_trans_destroy(handle, 0);
@@ -1526,6 +1591,16 @@ TEST_F(SmemTransTest, smem_trans_batch_read_write)
         _exit(STORE_CREATE_RETRY_FAILED_EXIT_CODE);
     };
     {
+        // syncPipe[0..1]: 接收端注册完成 → 发送端；syncPipe[2..3]: 发送端传输完成 → 接收端
+        int syncPipe[4] = {-1, -1, -1, -1};
+        if (pipe(&syncPipe[0]) != 0) {
+            syncPipe[0] = -1;
+            syncPipe[1] = -1;
+        }
+        if (pipe(&syncPipe[2]) != 0) {
+            syncPipe[2] = -1;
+            syncPipe[3] = -1;
+        }
         pid_t pids[rankSize];
         uint32_t maxProcess = rankSize;
         for (uint32_t i = 0; i < rankSize; ++i) {
@@ -1537,14 +1612,27 @@ TEST_F(SmemTransTest, smem_trans_batch_read_write)
                 break;
             }
             if (pids[i] == 0) {
+                (void)prctl(PR_SET_PDEATHSIG, SIGKILL); // 父进程被强杀时不残留占用固定端口的子进程
+                if (i == 0) {
+                    close(syncPipe[1]); // rank0: 只保留 ready 读端与 done 写端
+                    close(syncPipe[2]);
+                } else {
+                    close(syncPipe[0]); // rank1: 只保留 ready 写端与 done 读端
+                    close(syncPipe[3]);
+                }
                 smem_set_conf_store_tls(false, nullptr, 0);
                 if (i == 0) {
                     createStoreWithRetry(STORE_URL);
                 }
-                func(i, rankSize, trans_options[i], addrPtrs, capacities, unique_ids);
+                func(i, rankSize, trans_options[i], addrPtrs, capacities, unique_ids, syncPipe);
                 _exit(0);
             }
         }
+
+        close(syncPipe[0]);
+        close(syncPipe[1]);
+        close(syncPipe[2]);
+        close(syncPipe[3]);
 
         if (needKillOthers) {
             for (uint32_t i = 0; i < maxProcess; ++i) {
@@ -1555,33 +1643,9 @@ TEST_F(SmemTransTest, smem_trans_batch_read_write)
             ASSERT_NE(needKillOthers, true);
         }
 
-        for (uint32_t i = 0; i < rankSize; ++i) {
-            int status = 0;
-            waitpid(pids[i], &status, 0);
-            EXPECT_EQ(WIFEXITED(status), true);
-            if (WIFEXITED(status)) {
-                EXPECT_EQ(WEXITSTATUS(status), 0);
-                if (WEXITSTATUS(status) != 0 && !needKillOthers) {
-                    needKillOthers = true;
-                    for (uint32_t j = 0; j < rankSize; ++j) {
-                        if (i != j && pids[j] > 0) {
-                            kill(pids[j], SIGKILL);
-                            int killedStatus = 0;
-                            waitpid(pids[j], &killedStatus, 0);
-                        }
-                    }
-                }
-            } else {
-                needKillOthers = true;
-                for (uint32_t j = 0; j < rankSize; ++j) {
-                    if (i != j && pids[j] > 0) {
-                        kill(pids[j], SIGKILL);
-                        int killedStatus = 0;
-                        waitpid(pids[j], &killedStatus, 0);
-                    }
-                }
-            }
-        }
+        std::array<int, 2> exitCodes = {{-1, -1}};
+        bool allExitedZero = WaitRanksForAttempt(pids, rankSize, TRANS_RANK_EXIT_TIMEOUT_MS, exitCodes);
+        EXPECT_EQ(allExitedZero, true) << "rank0 exit=" << exitCodes[0] << " rank1 exit=" << exitCodes[1];
     }
     delete[] sender_buffer;
     delete[] recv_buffer;
@@ -1600,32 +1664,25 @@ TEST_F(SmemTransTest, smem_trans_batch_write_ipv6)
 
     auto func = [](uint32_t rank, uint32_t rankCount, smem_trans_config_t trans_options,
                    std::vector<std::vector<void *>> addrPtrs, std::vector<size_t> capacities,
-                   const std::array<const char *, 2> unique_ids) {
+                   const std::array<const char *, 2> unique_ids, const int *syncPipe) {
         trans_options.dataOpType = SMEMB_DATA_OP_HOST_TCP;
         auto classifyAddressMaskPtr = static_cast<ClassifyAddressMaskMemberFn>(&HybmVaManager::ClassifyAddressMask);
         MOCKER_CPP(classifyAddressMaskPtr, uint8_t(*)(HybmVaManager *, const uint64_t))
             .stubs()
             .will(returnValue(MASK_MOCK_VAL));
-        int ret = smem_trans_init(&trans_options);
+        int ret = smem_trans_init(trans_options.deviceId, 0);
         if (ret != 0) {
             _exit(1);
         }
+        ReserveRankEntityIds(rank);
         constexpr int retryIntervalMs = TRANS_RETRY_INTERVAL_MS;
-        if (rank == 1) {
-            // The receiver starts late on purpose: the sender (fork0, the store host) joins the group and registers
-            // first, so that when the receiver joins the server delivers ADDWLST/ESTCONN and its registered slices can
-            // be broadcast to the sender.
-            // Putting the delay on the sender side would leave the two child processes with no overlap in lifetime
-            // (the receiver exits 1s after registering),
-            // which makes the sender's batch_write retry "session not found" all the way (always reproducible under
-            // the ASAN CI).
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
         void *handle = nullptr;
         {
             constexpr int createMaxRetry = 120;
             for (int retry = 0; retry < createMaxRetry; ++retry) {
-                handle = smem_trans_create(STORE_URL_IPV6, unique_ids[rank], &trans_options);
+                handle = smem_trans_create(&MakeTransConfig(trans_options.role, unique_ids[rank],
+                                                            trans_options.deviceId, SMEMB_DATA_OP_HOST_TCP),
+                                           0);
                 if (handle != nullptr) {
                     break;
                 }
@@ -1641,10 +1698,31 @@ TEST_F(SmemTransTest, smem_trans_batch_write_ipv6)
             _exit(3);
         }
 
+        // trans 仅支持「先注册内存再 join」：接收端先发布已注册切片，发送端等待后再建链（join），
+        // 对端切片由 join 携带，不依赖 join 之后被忽略的 ADD_SLICES 广播。
+        if (rank == 1) {
+            char done = 'r';
+            (void)write(syncPipe[1], &done, 1);
+        }
+        if (rank == 0) {
+            char done = 0;
+            ssize_t n = 0;
+            do {
+                n = read(syncPipe[0], &done, 1);
+            } while (n < 0 && errno == EINTR);
+            if (n != 1) {
+                _exit(7);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(TRANS_SYNC_WAIT_MS));
+        }
+
         if (rank == 0) {
             const void *srcAddr[] = {addrPtrs[0][0]};
+            // 失败重试内部可能阻塞数十秒，故叠加墙钟上限，保证失败尝试有界退出
             constexpr int writeMaxRetry = TRANS_RETRY_COUNT;
-            for (int retry = 0; retry < writeMaxRetry; ++retry) {
+            const auto peerDeadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(TRANS_PEER_WAIT_TIMEOUT_MS);
+            for (int retry = 0; retry < writeMaxRetry && std::chrono::steady_clock::now() < peerDeadline; ++retry) {
                 ret =
                     smem_trans_batch_write(handle, srcAddr, unique_ids[1], addrPtrs[1].data(), capacities.data(), 1, 0);
                 if (ret == SM_OK) {
@@ -1655,9 +1733,17 @@ TEST_F(SmemTransTest, smem_trans_batch_write_ipv6)
             if (ret != SM_OK) {
                 _exit(4);
             }
+            // 通知接收端传输已完成（rank0 提前失败时写端随进程退出关闭，接收端读到 EOF 同样能退出）
+            char fin = 'd';
+            (void)write(syncPipe[3], &fin, 1);
         }
         if (rank == 1) {
-            std::this_thread::sleep_for(std::chrono::seconds(TRANS_TEST_WAIT_TIME));
+            // 等发送端完成信号再注销（rank0 提前失败时通过 EOF 退出）：固定 sleep 覆盖不到发送端
+            // 建链/重试耗时，接收端过早退出会让发送端重试全部失败
+            auto sig = WaitPipeSignal(syncPipe[2], 'd', TRANS_PEER_WAIT_TIMEOUT_MS);
+            if (sig <= 0) {
+                std::cout << "[trans] rank 1 wait peer done: sig=" << sig << std::endl;
+            }
         }
 
         smem_trans_destroy(handle, 0);
@@ -1671,19 +1757,30 @@ TEST_F(SmemTransTest, smem_trans_batch_write_ipv6)
     bool testSuccess = false;
     constexpr int maxAttempts = 5;
     for (int attempt = 0; attempt < maxAttempts && !testSuccess; ++attempt) {
+        // syncPipe[0..1]: 接收端注册完成 → 发送端；syncPipe[2..3]: 发送端传输完成 → 接收端
+        int syncPipe[4] = {-1, -1, -1, -1};
+        if (pipe(&syncPipe[0]) != 0 || pipe(&syncPipe[2]) != 0) {
+            continue;
+        }
         pid_t pids[rankSize] = {0};
-        bool allExitedZero = true;
         bool needKillOthers = false;
         uint32_t maxProcess = rankSize;
         for (uint32_t i = 0; i < rankSize; ++i) {
             pids[i] = fork();
             if (pids[i] == -1) {
                 maxProcess = i;
-                allExitedZero = false;
                 needKillOthers = true;
                 break;
             }
             if (pids[i] == 0) {
+                (void)prctl(PR_SET_PDEATHSIG, SIGKILL); // 父进程被强杀时不残留占用固定端口的子进程
+                if (i == 0) {
+                    close(syncPipe[1]); // rank0: 只保留 ready 读端与 done 写端
+                    close(syncPipe[2]);
+                } else {
+                    close(syncPipe[0]); // rank1: 只保留 ready 写端与 done 读端
+                    close(syncPipe[3]);
+                }
                 smem_set_conf_store_tls(false, nullptr, 0);
                 if (i == 0) {
                     int ret = -1;
@@ -1700,10 +1797,15 @@ TEST_F(SmemTransTest, smem_trans_batch_write_ipv6)
                         _exit(STORE_CREATE_RETRY_FAILED_EXIT_CODE);
                     }
                 }
-                func(i, rankSize, trans_options[i], addrPtrs, capacities, unique_ids);
+                func(i, rankSize, trans_options[i], addrPtrs, capacities, unique_ids, syncPipe);
                 _exit(0);
             }
         }
+        close(syncPipe[0]);
+        close(syncPipe[1]);
+        close(syncPipe[2]);
+        close(syncPipe[3]);
+
         if (needKillOthers) {
             for (uint32_t i = 0; i < maxProcess; ++i) {
                 if (pids[i] > 0) {
@@ -1714,20 +1816,12 @@ TEST_F(SmemTransTest, smem_trans_batch_write_ipv6)
             }
             continue;
         }
-        for (uint32_t i = 0; i < rankSize; ++i) {
-            int status = 0;
-            waitpid(pids[i], &status, 0);
-            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                allExitedZero = false;
-                for (uint32_t j = 0; j < rankSize; ++j) {
-                    if (i != j && pids[j] > 0) {
-                        kill(pids[j], SIGKILL);
-                    }
-                }
-                break;
-            }
+        std::array<int, 2> exitCodes = {{-1, -1}};
+        testSuccess = WaitRanksForAttempt(pids, rankSize, TRANS_RANK_EXIT_TIMEOUT_MS, exitCodes);
+        if (!testSuccess) {
+            std::cout << "[trans] attempt " << attempt << " failed: rank0 exit=" << exitCodes[0]
+                      << " rank1 exit=" << exitCodes[1] << std::endl;
         }
-        testSuccess = allExitedZero;
     }
     EXPECT_EQ(testSuccess, true);
     delete[] sender_buffer;
@@ -1752,11 +1846,11 @@ TEST_F(SmemTransTest, smem_trans_batch_write_failed_invalid_param)
         // first create server
         smem_set_conf_store_tls(false, nullptr, 0);
         smem_create_config_store(STORE_URL, SMEM_STORE_SKIP_RECOVER);
-        int ret = smem_trans_init(&g_trans_options);
+        int ret = smem_trans_init(0, 0);
         EXPECT_EQ(ret, 0);
 
         // client connect to server when initializing
-        auto handle = smem_trans_create(STORE_URL, UNIQUE_ID, &g_trans_options);
+        auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_ID), 0);
 
         // handle = nullptr
         ret = smem_trans_batch_write(nullptr, srcAddrPtrs.data(), UNIQUE_ID, destAddrPtrs.data(), dataSizes.data(),
@@ -1837,11 +1931,11 @@ TEST_F(SmemTransTest, smem_trans_batch_write_failed_invalid_param_ipv6)
         // first create server
         smem_set_conf_store_tls(false, nullptr, 0);
         smem_create_config_store(STORE_URL_IPV6, SMEM_STORE_SKIP_RECOVER);
-        int ret = smem_trans_init(&g_trans_options);
+        int ret = smem_trans_init(0, 0);
         EXPECT_EQ(ret, 0);
 
         // client connect to server when initializing
-        auto handle = smem_trans_create(STORE_URL_IPV6, UNIQUE_IPV6_ID, &g_trans_options);
+        auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_IPV6_ID), 0);
 
         // handle = nullptr
         ret = smem_trans_batch_write(nullptr, srcAddrPtrs.data(), UNIQUE_IPV6_ID, destAddrPtrs.data(), dataSizes.data(),
@@ -1921,11 +2015,11 @@ TEST_F(SmemTransTest, smem_trans_register_mems_success_receiver)
         // first create server
         smem_set_conf_store_tls(false, nullptr, 0);
         smem_create_config_store(STORE_URL, SMEM_STORE_SKIP_RECOVER);
-        int ret = smem_trans_init(&g_trans_options);
+        int ret = smem_trans_init(0, 0);
         EXPECT_EQ(ret, 0);
 
         // client connect to server when initializing
-        auto handle = smem_trans_create(STORE_URL, UNIQUE_ID, &trans_options);
+        auto handle = smem_trans_create(&MakeTransConfig(trans_options.role, UNIQUE_ID, trans_options.deviceId), 0);
 
         ret = smem_trans_batch_register_mem(handle, addrPtrs.data(), capacities.data(), capacities.size(), 0);
         if (ret != SM_OK) {
@@ -1961,11 +2055,11 @@ TEST_F(SmemTransTest, smem_trans_register_mems_success_receiver_ipv6)
     // first create server
     smem_set_conf_store_tls(false, nullptr, 0);
     smem_create_config_store(STORE_URL_IPV6, SMEM_STORE_SKIP_RECOVER);
-    int ret = smem_trans_init(&g_trans_options);
+    int ret = smem_trans_init(0, 0);
     EXPECT_EQ(ret, 0);
 
     // client connect to server when initializing
-    auto handle = smem_trans_create(STORE_URL_IPV6, UNIQUE_IPV6_ID, &trans_options);
+    auto handle = smem_trans_create(&MakeTransConfig(trans_options.role, UNIQUE_IPV6_ID, trans_options.deviceId), 0);
 
     ret = smem_trans_batch_register_mem(handle, addrPtrs.data(), capacities.data(), capacities.size(), 0);
     EXPECT_EQ(ret, SM_OK);
@@ -1976,6 +2070,22 @@ TEST_F(SmemTransTest, smem_trans_register_mems_success_receiver_ipv6)
     smem_trans_uninit(0);
 }
 
+TEST_F(SmemTransTest, smem_trans_batch_status_query_failed_invalid_param)
+{
+    uint32_t deviceId = 0U;
+
+    int32_t ret = smem_trans_init(deviceId, 0);
+    ASSERT_EQ(ret, SM_OK);
+    auto handle = smem_trans_create(&MakeTransConfig(SMEM_TRANS_SENDER, UNIQUE_ID), 0);
+    ASSERT_NE(handle, nullptr);
+
+    uint32_t batchId = 0U;
+    ret = smem_trans_batch_status_query(handle, batchId, nullptr, 0);
+    EXPECT_EQ(ret, SM_INVALID_PARAM);
+
+    smem_trans_destroy(handle, 0);
+    smem_trans_uninit(0);
+}
 // ===== CombineMemories / AlignMemory unit tests =====
 
 namespace {
@@ -1990,6 +2100,25 @@ void ExpectMerged(const std::vector<MemPair> &got, const std::vector<std::pair<u
         EXPECT_EQ(reinterpret_cast<uint64_t>(got[i].first), expect[i].first) << "idx " << i;
         EXPECT_EQ(got[i].second, expect[i].second) << "idx " << i;
     }
+}
+
+// 裸构造的 SmemTransConnection（仅成员初始化，不做 Initialize）：store_ 为空时任何时机触发
+// 析构都会在 ClearStoreCallbacks 解引用空 store，故以 new 出的进程级容器持有引用且不主动
+// 释放，UT 进程退出时故意泄漏以避免静态析构崩溃
+SmemTransConnectionPtr MakeBareTransConn(const smem_trans_config_t &config, hybm_entity_t entity = nullptr)
+{
+    static auto *keepAlive = new std::vector<SmemTransConnectionPtr>(); // NOLINT: 故意泄漏，见上
+    StorePtr emptyStore;
+    // 裸构造不建链，对端 name 用同一占位串（解析失败仅表示不缓存，不影响本用例关注的成员行为）
+    auto conn = SmMakeRef<SmemTransConnection>(
+        config, "ut-conn", "ut-conn", 0, entity, emptyStore, WorkerUniqueId{},
+        [](const std::string &, uint32_t &rank) {
+            rank = K_PEER_RANK_ONE;
+            return SM_OK;
+        },
+        [](const std::string &) {});
+    keepAlive->push_back(conn);
+    return conn;
 }
 } // namespace
 
@@ -2108,16 +2237,14 @@ TEST_F(SmemTransTest, CombineMemories_pd_kv_boundary_regression)
 }
 
 /* ================================================================== */
-/*  OnEstablishConnection: register external slices (ESTABLISH path)   */
-/*  These run in-process (the ipv6 tests exercise the same code via    */
-/*  fork, but child-process coverage is not merged into the gate).     */
+/*  OnEstablishConnection/OnAddToWhitelist: register external slices    */
+/*  (ESTABLISH + ADDWLST paths, in-process; the ipv6 tests exercise     */
+/*  the same code via fork)                                            */
 /* ================================================================== */
 TEST_F(SmemTransTest, OnEstablishConnection_RegistersExternalSlices)
 {
     smem_trans_config_t config = g_trans_options; // SMEM_TRANS_SENDER
-    std::string name = "ut-entry";
-    ock::smem::StorePtr store;
-    SmemTransEntry entry(config, name, 0, 0, store);
+    auto conn = MakeBareTransConn(config);
 
     MOCKER_CPP(&hybm_import, int32_t(*)(hybm_entity_t, const hybm_exchange_info[], uint32_t, void *[], uint32_t))
         .stubs()
@@ -2127,306 +2254,143 @@ TEST_F(SmemTransTest, OnEstablishConnection_RegistersExternalSlices)
         .stubs()
         .will(returnValue(SMEM_OK));
 
-    // baseInfo carries the peer session; role is stored in the reserved field
+    // baseInfo carries the peer session; role is stored in the reserved field (wire format [u][descLen][desc])
     SmemTransExchangeInfo base{};
     base.u.session.reserved = static_cast<uint16_t>(SMEM_TRANS_RECEIVER);
-    std::vector<uint8_t> baseBytes(reinterpret_cast<uint8_t *>(&base),
-                                   reinterpret_cast<uint8_t *>(&base) + sizeof(base));
+    std::vector<uint8_t> baseBytes;
+    SerializeTransExchangeInfo(baseBytes, base);
 
     SmemTransExchangeInfo slice1{};
     slice1.u.address = LocalMapAddress(reinterpret_cast<void *>(K_SLICE1_ADDR), K_SLICE1_SIZE);
-    std::vector<uint8_t> slice1Bytes(reinterpret_cast<uint8_t *>(&slice1),
-                                     reinterpret_cast<uint8_t *>(&slice1) + sizeof(slice1));
+    std::vector<uint8_t> slice1Bytes;
+    SerializeTransExchangeInfo(slice1Bytes, slice1);
     SmemTransExchangeInfo slice2{};
     slice2.u.address = LocalMapAddress(reinterpret_cast<void *>(K_SLICE2_ADDR), K_SLICE2_SIZE);
-    std::vector<uint8_t> slice2Bytes(reinterpret_cast<uint8_t *>(&slice2),
-                                     reinterpret_cast<uint8_t *>(&slice2) + sizeof(slice2));
+    std::vector<uint8_t> slice2Bytes;
+    SerializeTransExchangeInfo(slice2Bytes, slice2);
 
     RankFullInfo peer;
     peer.rankId = 1;
     peer.baseInfo = baseBytes;
     peer.externalInfo.push_back(slice1Bytes);
 
-    // first call: remoteSlices_ empty -> needImport -> hybm_import -> register
-    EXPECT_EQ(entry.OnEstablishConnection(1, {peer}, 0), SMEM_OK);
+    // ESTABLISH: alloc the peer override-rank window and connect transport
+    EXPECT_EQ(conn->OnEstablishConnection(1, {peer}, 0), SMEM_OK);
+    // ADD whitelist: import entity + slices and record the local->global mapping
+    EXPECT_EQ(conn->OnAddToWhitelist(1, {peer}, 0), SM_OK);
+    {
+        ock::mf::ReadGuard locker(conn->remoteSliceRwMutex_);
+        ASSERT_EQ(conn->remoteSlices_.size(), 1U);
+        EXPECT_EQ(conn->remoteSlices_.begin()->second.size(), 1U);
+    }
 
-    // identical slices again: dedup finds all addresses -> import skipped
-    EXPECT_EQ(entry.OnEstablishConnection(1, {peer}, 0), SMEM_OK);
+    // repeated ESTABLISH/ADD with identical slices: idempotent, no duplicate records
+    EXPECT_EQ(conn->OnEstablishConnection(1, {peer}, 0), SMEM_OK);
+    EXPECT_EQ(conn->OnAddToWhitelist(1, {peer}, 0), SM_OK);
+    {
+        ock::mf::ReadGuard locker(conn->remoteSliceRwMutex_);
+        EXPECT_EQ(conn->remoteSlices_.begin()->second.size(), 1U);
+    }
 
-    // a new slice appears: dedup finds a missing address -> import again
+    // a new slice appears: imported additionally and recorded
     peer.externalInfo.push_back(slice2Bytes);
-    EXPECT_EQ(entry.OnEstablishConnection(1, {peer}, 0), SMEM_OK);
-
-    // malformed baseInfo (wrong size) -> error path, still handled gracefully
-    RankFullInfo badPeer = peer;
-    badPeer.baseInfo.assign(K_SLICE2_SIZE / K_HALF_DIVISOR, 0);
-    EXPECT_EQ(entry.OnEstablishConnection(K_PEER_RANK_TWO, {badPeer}, 0), SMEM_OK);
+    EXPECT_EQ(conn->OnAddToWhitelist(1, {peer}, 0), SM_OK);
+    {
+        ock::mf::ReadGuard locker(conn->remoteSliceRwMutex_);
+        EXPECT_EQ(conn->remoteSlices_.begin()->second.size(), 2U);
+    }
 }
 
-TEST_F(SmemTransTest, Rejoin_RemovesOldHybmRankBeforeImport)
+/* ADD_SLICES: slices registered after the ADDWLST snapshot must still reach the importer */
+TEST_F(SmemTransTest, OnAddSlices_ImportsIncrementalSlices)
 {
-    g_transRankOperations.clear();
-    g_transRemoveResult = SMEM_OK;
+    smem_trans_config_t config = g_trans_options; // SMEM_TRANS_SENDER
+    auto conn = MakeBareTransConn(config, reinterpret_cast<hybm_entity_t>(0x1));
+
     MOCKER_CPP(&hybm_import, int32_t(*)(hybm_entity_t, const hybm_exchange_info[], uint32_t, void *[], uint32_t))
         .stubs()
-        .will(invoke(CaptureTransImport));
-    MOCKER_CPP(&hybm_remove_imported, int32_t(*)(hybm_entity_t, uint32_t, uint32_t))
+        .will(returnValue(BM_OK));
+    MOCKER_CPP(&hybm_mmap, int32_t(*)(hybm_entity_t, uint32_t)).stubs().will(returnValue(BM_OK));
+    MOCKER_CPP(&hybm_transport_connect, int32_t(*)(hybm_entity_t, const uint32_t *, uint32_t, uint32_t))
         .stubs()
-        .will(invoke(CaptureTransRemove));
+        .will(returnValue(SMEM_OK));
 
-    auto config = g_trans_options;
-    std::string name = "127.0.0.1:5321";
-    StorePtr store;
-    SmemTransEntry entry(config, name, 0, 0, store);
-    entry.entity_ = reinterpret_cast<hybm_entity_t>(0x1);
-    TransFakeEntityGuard entityGuard(entry);
+    SmemTransExchangeInfo base{};
+    base.u.session.reserved = static_cast<uint16_t>(SMEM_TRANS_RECEIVER);
+    std::vector<uint8_t> baseBytes;
+    SerializeTransExchangeInfo(baseBytes, base);
 
-    RankFullInfo oldPeer;
-    oldPeer.rankId = 1;
-    oldPeer.baseInfo = MakeTransEntityBaseInfo(64, SMEM_TRANS_RECEIVER);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {oldPeer}, 0), SMEM_OK);
-    ASSERT_EQ(entry.rankToHybmRank_.at(1), 64U);
-
-    RankFullInfo replacement = oldPeer;
-    replacement.baseInfo = MakeTransEntityBaseInfo(65, SMEM_TRANS_RECEIVER);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {replacement}, 0), SMEM_OK);
-    ASSERT_EQ(entry.rankToHybmRank_.at(1), 65U);
-    RankFullInfo leaving;
-    leaving.rankId = 1; // Legacy rank-only REMOVE must also use the imported HYBM rank.
-    EXPECT_EQ(entry.OnRemoveFromWhitelist(0, {leaving}, 0), SMEM_OK);
-    EXPECT_TRUE(entry.rankToHybmRank_.empty());
-    EXPECT_TRUE(entry.rankToPeerBase_.empty());
-
-    ASSERT_EQ(g_transRankOperations.size(), 4U);
-    EXPECT_EQ(g_transRankOperations[0].operation, "import");
-    EXPECT_EQ(g_transRankOperations[0].rank, 64U);
-    EXPECT_EQ(g_transRankOperations[1].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[1].rank, 64U);
-    EXPECT_EQ(g_transRankOperations[2].operation, "import");
-    EXPECT_EQ(g_transRankOperations[2].rank, 65U);
-    EXPECT_EQ(g_transRankOperations[3].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[3].rank, 65U);
-    EXPECT_EQ(
-        std::find_if(g_transRankOperations.begin(), g_transRankOperations.end(),
-                     [](const auto &operation) { return operation.operation == "remove" && operation.rank == 1U; }),
-        g_transRankOperations.end());
-}
-
-TEST_F(SmemTransTest, Rejoin_SameIdentityIsIdempotent)
-{
-    g_transRankOperations.clear();
-    g_transRemoveResult = SMEM_OK;
-    MOCKER_CPP(&hybm_import, int32_t(*)(hybm_entity_t, const hybm_exchange_info[], uint32_t, void *[], uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransImport));
-    MOCKER_CPP(&hybm_remove_imported, int32_t(*)(hybm_entity_t, uint32_t, uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransRemove));
-
-    auto config = g_trans_options;
-    std::string name = "127.0.0.1:5321";
-    StorePtr store;
-    SmemTransEntry entry(config, name, 0, 0, store);
-    entry.entity_ = reinterpret_cast<hybm_entity_t>(0x1);
-    TransFakeEntityGuard entityGuard(entry);
+    SmemTransExchangeInfo slice1{};
+    slice1.u.address = LocalMapAddress(reinterpret_cast<void *>(K_SLICE1_ADDR), K_SLICE1_SIZE);
+    std::vector<uint8_t> slice1Bytes;
+    SerializeTransExchangeInfo(slice1Bytes, slice1);
 
     RankFullInfo peer;
-    peer.rankId = 1;
-    peer.baseInfo = MakeTransEntityBaseInfo(65, SMEM_TRANS_RECEIVER);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {peer}, 0), SMEM_OK);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {peer}, 0), SMEM_OK);
+    peer.rankId = K_PEER_RANK_ONE;
+    peer.baseInfo = baseBytes;
+    peer.externalInfo.push_back(slice1Bytes);
 
-    ASSERT_EQ(g_transRankOperations.size(), 2U);
-    EXPECT_EQ(g_transRankOperations[0].operation, "import");
-    EXPECT_EQ(g_transRankOperations[1].operation, "import");
-    EXPECT_EQ(entry.rankToHybmRank_.at(1), 65U);
+    // snapshot path: only slice1 is known when ADDWLST fires
+    EXPECT_EQ(conn->OnEstablishConnection(K_PEER_RANK_ONE, {peer}, 0), SMEM_OK);
+    EXPECT_EQ(conn->OnAddToWhitelist(K_PEER_RANK_ONE, {peer}, 0), SM_OK);
+    {
+        ock::mf::ReadGuard locker(conn->remoteSliceRwMutex_);
+        ASSERT_EQ(conn->remoteSlices_.size(), 1U);
+        EXPECT_EQ(conn->remoteSlices_.begin()->second.size(), 1U);
+    }
+
+    // slice2 only ever arrives through ADD_SLICES: it must be imported into the same peer window
+    SmemTransExchangeInfo slice2{};
+    slice2.u.address = LocalMapAddress(reinterpret_cast<void *>(K_SLICE2_ADDR), K_SLICE2_SIZE);
+    std::vector<uint8_t> slice2Bytes;
+    SerializeTransExchangeInfo(slice2Bytes, slice2);
+    MultiBytes incremental;
+    incremental.push_back(slice2Bytes);
+    EXPECT_EQ(conn->OnAddSlices(K_PEER_RANK_ONE, incremental, 0), SMEM_OK);
+    {
+        ock::mf::ReadGuard locker(conn->remoteSliceRwMutex_);
+        ASSERT_EQ(conn->remoteSlices_.size(), 1U) << "incremental slice must reuse the peer entry";
+        EXPECT_EQ(conn->remoteSlices_.begin()->second.size(), 2U);
+    }
+
+    // re-delivery of the same batch stays idempotent
+    EXPECT_EQ(conn->OnAddSlices(K_PEER_RANK_ONE, incremental, 0), SMEM_OK);
+    {
+        ock::mf::ReadGuard locker(conn->remoteSliceRwMutex_);
+        EXPECT_EQ(conn->remoteSlices_.begin()->second.size(), 2U);
+    }
+
+    // a rank that this connection never registered belongs to another connection: skip it
+    EXPECT_EQ(conn->OnAddSlices(K_PEER_RANK_TWO, incremental, 0), SMEM_OK);
+    {
+        ock::mf::ReadGuard locker(conn->remoteSliceRwMutex_);
+        EXPECT_EQ(conn->remoteSlices_.size(), 1U);
+    }
+
+    // empty batch is a no-op
+    EXPECT_EQ(conn->OnAddSlices(K_PEER_RANK_ONE, MultiBytes{}, 0), SMEM_OK);
 }
 
-TEST_F(SmemTransTest, RemoveWhitelist_IgnoresDelayedOldIdentity)
+/* ADD_SLICES 回调注册：漏注册时 SmemGroupManagerClient 只打 INFO 后 return 0，增量片静默丢弃。
+ * ADD_SLICES 无 ack 也不参与 link 推进，漏注册没有任何兜底通道，故必须有用例守住注册本身 */
+TEST_F(SmemTransTest, Callbacks_WireAddSlicesIntoDispatcher)
 {
-    g_transRankOperations.clear();
-    g_transRemoveResult = SMEM_OK;
-    MOCKER_CPP(&hybm_import, int32_t(*)(hybm_entity_t, const hybm_exchange_info[], uint32_t, void *[], uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransImport));
-    MOCKER_CPP(&hybm_remove_imported, int32_t(*)(hybm_entity_t, uint32_t, uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransRemove));
+    smem_trans_config_t config = g_trans_options;
+    auto conn = MakeBareTransConn(config, reinterpret_cast<hybm_entity_t>(0x1));
 
-    auto config = g_trans_options;
-    std::string name = "127.0.0.1:5321";
-    StorePtr store;
-    SmemTransEntry entry(config, name, 0, 0, store);
-    entry.entity_ = reinterpret_cast<hybm_entity_t>(0x1);
-    TransFakeEntityGuard entityGuard(entry);
+    SmemGroupCommandAsyncDispatcher asyncMgr(nullptr);
+    ASSERT_EQ(conn->RegisterAsyncCallbacks(&asyncMgr), SMEM_OK);
+    EXPECT_TRUE(static_cast<bool>(asyncMgr.onAddToWhitelist_));
+    EXPECT_TRUE(static_cast<bool>(asyncMgr.onEstablishConnection_));
+    EXPECT_TRUE(static_cast<bool>(asyncMgr.onAddSlices_));
 
-    RankFullInfo oldPeer;
-    oldPeer.rankId = 1;
-    oldPeer.baseInfo = MakeTransEntityBaseInfo(64, SMEM_TRANS_RECEIVER);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {oldPeer}, 0), SMEM_OK);
+    auto executor = SmMakeRef<SmemGroupManagerClient>();
+    ASSERT_EQ(conn->RegisterExecutorCallbacks(executor.Get(), &asyncMgr), SMEM_OK);
+    ASSERT_TRUE(static_cast<bool>(executor->onAddSlices_));
 
-    RankFullInfo replacement = oldPeer;
-    replacement.baseInfo = MakeTransEntityBaseInfo(65, SMEM_TRANS_RECEIVER);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {replacement}, 0), SMEM_OK);
-    ASSERT_EQ(entry.OnRemoveFromWhitelist(0, {oldPeer}, 0), SMEM_OK);
-
-    ASSERT_EQ(g_transRankOperations.size(), 3U);
-    EXPECT_EQ(g_transRankOperations[0].operation, "import");
-    EXPECT_EQ(g_transRankOperations[1].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[1].rank, 64U);
-    EXPECT_EQ(g_transRankOperations[2].operation, "import");
-    EXPECT_EQ(entry.rankToHybmRank_.at(1), 65U);
-}
-
-TEST_F(SmemTransTest, Rejoin_SameRankNewProcessReplacesOldIdentity)
-{
-    g_transRankOperations.clear();
-    g_transRemoveResult = SMEM_OK;
-    MOCKER_CPP(&hybm_import, int32_t(*)(hybm_entity_t, const hybm_exchange_info[], uint32_t, void *[], uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransImport));
-    MOCKER_CPP(&hybm_remove_imported, int32_t(*)(hybm_entity_t, uint32_t, uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransRemove));
-
-    auto config = g_trans_options;
-    std::string name = "127.0.0.1:5321";
-    StorePtr store;
-    SmemTransEntry entry(config, name, 0, 0, store);
-    entry.entity_ = reinterpret_cast<hybm_entity_t>(0x1);
-    TransFakeEntityGuard entityGuard(entry);
-    RankFullInfo oldPeer;
-    oldPeer.rankId = 1;
-    oldPeer.baseInfo = MakeTransEntityBaseInfo(64, SMEM_TRANS_RECEIVER, 100);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {oldPeer}, 0), SMEM_OK);
-    RankFullInfo replacement = oldPeer;
-    replacement.baseInfo = MakeTransEntityBaseInfo(64, SMEM_TRANS_RECEIVER, 200);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {replacement}, 0), SMEM_OK);
-    EXPECT_EQ(entry.OnRemoveFromWhitelist(0, {oldPeer}, 0), SMEM_OK);
-    ASSERT_EQ(g_transRankOperations.size(), 3U);
-    EXPECT_EQ(g_transRankOperations[1].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[1].rank, 64U);
-    EXPECT_EQ(g_transRankOperations[2].operation, "import");
-    EXPECT_EQ(entry.rankToHybmRank_.at(1), 64U);
-    EXPECT_EQ(entry.rankToPeerBase_.at(1), replacement.baseInfo);
-    EXPECT_EQ(entry.OnRemoveFromWhitelist(0, {replacement}, 0), SMEM_OK);
-    EXPECT_TRUE(entry.rankToHybmRank_.empty());
-}
-
-TEST_F(SmemTransTest, Rejoin_CleanupFailureDoesNotImportReplacement)
-{
-    g_transRankOperations.clear();
-    g_transRemoveResult = SM_ERROR;
-    MOCKER_CPP(&hybm_import, int32_t(*)(hybm_entity_t, const hybm_exchange_info[], uint32_t, void *[], uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransImport));
-    MOCKER_CPP(&hybm_remove_imported, int32_t(*)(hybm_entity_t, uint32_t, uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransRemove));
-
-    auto config = g_trans_options;
-    std::string name = "127.0.0.1:5321";
-    StorePtr store;
-    SmemTransEntry entry(config, name, 0, 0, store);
-    entry.entity_ = reinterpret_cast<hybm_entity_t>(0x1);
-    TransFakeEntityGuard entityGuard(entry);
-
-    RankFullInfo oldPeer;
-    oldPeer.rankId = 1;
-    oldPeer.baseInfo = MakeTransEntityBaseInfo(64, SMEM_TRANS_RECEIVER);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {oldPeer}, 0), SMEM_OK);
-
-    RankFullInfo replacement = oldPeer;
-    replacement.baseInfo = MakeTransEntityBaseInfo(65, SMEM_TRANS_RECEIVER);
-    EXPECT_EQ(entry.OnAddToWhitelist(0, {replacement}, 0), SM_ERROR);
-    ASSERT_EQ(g_transRankOperations.size(), 2U);
-    EXPECT_EQ(g_transRankOperations[0].operation, "import");
-    EXPECT_EQ(g_transRankOperations[0].rank, 64U);
-    EXPECT_EQ(g_transRankOperations[1].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[1].rank, 64U);
-    EXPECT_EQ(entry.rankToHybmRank_.at(1), 64U);
-}
-
-TEST_F(SmemTransTest, Rejoin_ImportFailureRollsBackOnlyReplacement)
-{
-    g_transRankOperations.clear();
-    g_transRemoveResult = SMEM_OK;
-    MOCKER_CPP(&hybm_import, int32_t(*)(hybm_entity_t, const hybm_exchange_info[], uint32_t, void *[], uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransImport));
-    MOCKER_CPP(&hybm_remove_imported, int32_t(*)(hybm_entity_t, uint32_t, uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransRemove));
-    auto config = g_trans_options;
-    std::string name = "127.0.0.1:5321";
-    StorePtr store;
-    SmemTransEntry entry(config, name, 0, 0, store);
-    entry.entity_ = reinterpret_cast<hybm_entity_t>(0x1);
-    TransFakeEntityGuard entityGuard(entry);
-    RankFullInfo peer;
-    peer.rankId = 1;
-    peer.baseInfo = MakeTransEntityBaseInfo(64, SMEM_TRANS_RECEIVER);
-    RankFullInfo unchanged;
-    unchanged.rankId = 2;
-    unchanged.baseInfo = MakeTransEntityBaseInfo(128, SMEM_TRANS_RECEIVER);
-    ASSERT_EQ(entry.OnAddToWhitelist(0, {peer, unchanged}, 0), SMEM_OK);
-    const auto unchangedWorker = entry.rankToWorkerId_.at(2);
-    peer.baseInfo = MakeTransEntityBaseInfo(65, SMEM_TRANS_RECEIVER);
-    g_transImportResult = SMEM_ERROR;
-    EXPECT_EQ(entry.OnAddToWhitelist(0, {peer, unchanged}, 0), SMEM_ERROR);
-    EXPECT_EQ(entry.rankToHybmRank_.count(1), 0U);
-    EXPECT_EQ(entry.rankToPeerBase_.count(1), 0U);
-    EXPECT_EQ(entry.rankToHybmRank_.at(2), 128U);
-    EXPECT_EQ(entry.rankToPeerBase_.at(2), unchanged.baseInfo);
-    EXPECT_EQ(entry.rankToWorkerId_.at(2), unchangedWorker);
-    ASSERT_EQ(g_transRankOperations.size(), 6U);
-    EXPECT_EQ(g_transRankOperations[2].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[2].rank, 64U);
-    EXPECT_EQ(g_transRankOperations[5].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[5].rank, 65U);
-    g_transImportResult = SMEM_OK;
-    EXPECT_EQ(entry.OnAddToWhitelist(0, {peer, unchanged}, 0), SMEM_OK);
-    EXPECT_EQ(entry.rankToHybmRank_.at(1), 65U);
-    EXPECT_EQ(entry.rankToHybmRank_.at(2), 128U);
-}
-
-TEST_F(SmemTransTest, Rejoin_FailedRollbackRetriesCleanupBeforeSameIdentityImport)
-{
-    g_transRankOperations.clear();
-    g_transImportResult = SMEM_ERROR;
-    g_transRemoveResult = SMEM_ERROR;
-    MOCKER_CPP(&hybm_import, int32_t(*)(hybm_entity_t, const hybm_exchange_info[], uint32_t, void *[], uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransImport));
-    MOCKER_CPP(&hybm_remove_imported, int32_t(*)(hybm_entity_t, uint32_t, uint32_t))
-        .stubs()
-        .will(invoke(CaptureTransRemove));
-    auto config = g_trans_options;
-    std::string name = "127.0.0.1:5321";
-    StorePtr store;
-    SmemTransEntry entry(config, name, 0, 0, store);
-    entry.entity_ = reinterpret_cast<hybm_entity_t>(0x1);
-    TransFakeEntityGuard entityGuard(entry);
-    RankFullInfo peer;
-    peer.rankId = 1;
-    peer.baseInfo = MakeTransEntityBaseInfo(64, SMEM_TRANS_RECEIVER);
-    EXPECT_EQ(entry.OnAddToWhitelist(0, {peer}, 0), SMEM_ERROR);
-    ASSERT_EQ(entry.rankToHybmRank_.at(1), 64U);
-    EXPECT_EQ(entry.rankToPeerBase_.count(1), 0U);
-    ASSERT_EQ(g_transRankOperations.size(), 2U);
-    EXPECT_EQ(g_transRankOperations[1].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[1].rank, 64U);
-    g_transImportResult = SMEM_OK;
-    EXPECT_EQ(entry.OnAddToWhitelist(0, {peer}, 0), SMEM_ERROR);
-    ASSERT_EQ(g_transRankOperations.size(), 3U);
-    EXPECT_EQ(g_transRankOperations[2].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[2].rank, 64U);
-    g_transRemoveResult = SMEM_OK;
-    EXPECT_EQ(entry.OnAddToWhitelist(0, {peer}, 0), SMEM_OK);
-    ASSERT_EQ(g_transRankOperations.size(), 5U);
-    EXPECT_EQ(g_transRankOperations[3].operation, "remove");
-    EXPECT_EQ(g_transRankOperations[3].rank, 64U);
-    EXPECT_EQ(g_transRankOperations[4].operation, "import");
-    EXPECT_EQ(g_transRankOperations[4].rank, 64U);
-    EXPECT_EQ(entry.rankToPeerBase_.at(1), peer.baseInfo);
+    // 端到端：store 下发的 ADD_SLICES 经 executor 回调进入 dispatcher 队列，而不是静默丢弃
+    MultiBytes slices;
+    slices.emplace_back(Bytes(4U, 0U));
+    EXPECT_EQ(executor->AddSlices(K_PEER_RANK_ONE, slices, 0), 0);
+    EXPECT_EQ(asyncMgr.addSlicesQueue_.size(), 1U);
 }

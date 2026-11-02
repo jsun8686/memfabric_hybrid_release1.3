@@ -245,7 +245,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_Import_Empty)
     std::vector<std::string> emptyInfos;
     void *addrs[1] = {nullptr};
 
-    auto ret = segment.Import(emptyInfos, addrs);
+    auto ret = segment.Import(emptyInfos, addrs, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_OK);
 }
 
@@ -272,7 +272,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_Import_ValidSliceMagic)
     std::vector<std::string> allExInfo = {infoStr};
     void *addresses[1] = {nullptr};
 
-    auto ret = segment.Import(allExInfo, addresses);
+    auto ret = segment.Import(allExInfo, addresses, HYBM_IMPORT_RANK_INVALID);
 
     EXPECT_NE(ret, BM_INVALID_PARAM);
 }
@@ -293,7 +293,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_Import_InvalidMagic)
     std::vector<std::string> infos = {badInfo};
     void *addrs[1] = {nullptr};
 
-    auto ret = segment.Import(infos, addrs);
+    auto ret = segment.Import(infos, addrs, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_INVALID_PARAM);
 }
 
@@ -312,7 +312,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_Import_AddressesNull)
 
     std::vector<std::string> infos = {badInfo};
 
-    auto ret = segment.Import(infos, nullptr);
+    auto ret = segment.Import(infos, nullptr, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_INVALID_PARAM);
 }
 
@@ -438,7 +438,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_ImportDeviceInfo_DeserializeFail
     EXPECT_EQ(segment.ValidateOptions(), BM_OK);
 
     std::string badInfo = "invalid_serialized_data";
-    auto ret = segment.ImportDeviceInfo(badInfo);
+    auto ret = segment.ImportDeviceInfo(badInfo, HYBM_IMPORT_RANK_INVALID);
     EXPECT_NE(ret, BM_OK);
 }
 
@@ -460,7 +460,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_ImportDeviceInfo_InvalidLogicDev
     deviceInfo.pid = 456;
 
     std::string info(reinterpret_cast<const char *>(&deviceInfo), sizeof(deviceInfo));
-    auto ret = segment.ImportDeviceInfo(info);
+    auto ret = segment.ImportDeviceInfo(info, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_ERROR);
 }
 
@@ -489,7 +489,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_ImportDeviceInfo_SuccessNoP2PNoS
     deviceInfo.pid = 456;
 
     std::string info(reinterpret_cast<const char *>(&deviceInfo), sizeof(deviceInfo));
-    auto ret = segment.ImportDeviceInfo(info);
+    auto ret = segment.ImportDeviceInfo(info, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_OK);
 
     EXPECT_TRUE(segment.importedDeviceInfo_.count(10) > 0);
@@ -511,7 +511,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_ImportSliceInfo_DeserializeFaile
 
     std::string badInfo = "invalid_data";
     ock::mf::MemSlicePtr remoteSlice;
-    auto ret = segment.ImportSliceInfo(badInfo, remoteSlice);
+    auto ret = segment.ImportSliceInfo(badInfo, remoteSlice, HYBM_IMPORT_RANK_INVALID);
     EXPECT_NE(ret, BM_OK);
 }
 
@@ -535,7 +535,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_ImportSliceInfo_InvalidLogicDevi
 
     std::string info(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     ock::mf::MemSlicePtr remoteSlice;
-    auto ret = segment.ImportSliceInfo(info, remoteSlice);
+    auto ret = segment.ImportSliceInfo(info, remoteSlice, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_ERROR);
 }
 
@@ -562,7 +562,7 @@ TEST_F(HybmDevSegmentTest, AsymmetricMemSegment_ImportSliceInfo_SuccessNoHardwar
 
     std::string info(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     ock::mf::MemSlicePtr remoteSlice;
-    auto ret = segment.ImportSliceInfo(info, remoteSlice);
+    auto ret = segment.ImportSliceInfo(info, remoteSlice, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_OK);
     ASSERT_NE(remoteSlice, nullptr);
 
@@ -719,7 +719,7 @@ TEST_F(HybmDevSegmentTest, DevLegacy_Import_DeserializeFailAndMagicInvalid)
 
     ock::mf::HybmDevLegacySegment segment(options, 0);
     std::vector<std::string> bad{"bad_format"};
-    EXPECT_EQ(segment.Import(bad, nullptr), BM_INVALID_PARAM);
+    EXPECT_EQ(segment.Import(bad, nullptr, HYBM_IMPORT_RANK_INVALID), BM_INVALID_PARAM);
 
     // 本 rank 自己的信息 → 跳过
     ock::mf::HbmExportInfo self{};
@@ -727,7 +727,7 @@ TEST_F(HybmDevSegmentTest, DevLegacy_Import_DeserializeFailAndMagicInvalid)
     self.rankId = options.rankId;
     std::string encoded;
     ASSERT_EQ(ock::mf::LiteralExInfoTranslater<ock::mf::HbmExportInfo>{}.Serialize(self, encoded), BM_OK);
-    EXPECT_EQ(segment.Import({encoded}, nullptr), BM_OK);
+    EXPECT_EQ(segment.Import({encoded}, nullptr, HYBM_IMPORT_RANK_INVALID), BM_OK);
 }
 
 TEST_F(HybmDevSegmentTest, DevLegacy_Mmap_SizeZeroAndAlreadyMapped)

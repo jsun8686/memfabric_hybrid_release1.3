@@ -241,8 +241,10 @@ Result HybmHostShmSegment::Export(const std::shared_ptr<MemSlice> &slice, std::s
     return BM_OK;
 }
 
-Result HybmHostShmSegment::Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept
+Result HybmHostShmSegment::Import(const std::vector<std::string> &allExInfo, void *addresses[],
+                                  uint32_t overrideRank) noexcept
 {
+    (void)overrideRank; // rank 覆盖仅 trans 场景（AsymmetricMemSegment）需要
     LiteralExInfoTranslater<ShmExportInfo> translator;
     std::vector<ShmExportInfo> deserializedInfos{allExInfo.size()};
     for (auto i = 0U; i < allExInfo.size(); i++) {

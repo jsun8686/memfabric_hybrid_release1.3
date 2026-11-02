@@ -89,8 +89,13 @@ public:
     /*
      * Import exchange info and translate it into data structure
      * @param allExInfo
+     * @param overrideRank not HYBM_IMPORT_RANK_INVALID: replace the rankId carried in exInfo with this local
+     *        rank, and remap the imported gva into the overrideRank's window (trans scene: one entity per
+     *        process, each uniqueId connection gets a unique local rank). Only relevant to segments carrying
+     *        rankId/gva layout.
      */
-    virtual Result Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept = 0;
+    virtual Result Import(const std::vector<std::string> &allExInfo, void *addresses[],
+                          uint32_t overrideRank = HYBM_IMPORT_RANK_INVALID) noexcept = 0;
 
     /*
      * delete imported memory area according to rankid

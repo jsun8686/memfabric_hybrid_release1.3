@@ -97,7 +97,7 @@ int32_t AccOffloadLocalDramEntry::Initialize(const offload_config_t &config)
             }
         }
 
-        base_ = reinterpret_cast<uint8_t *>(hybm_get_slice_va(entity_, slice_));
+        base_ = reinterpret_cast<uint8_t *>(hybm_get_slice_va(entity_, slice_, 0));
         if (base_ == nullptr) {
             OFFLOAD_LOG_ERROR("get slice va failed");
             ret = OFFLOAD_ERROR;

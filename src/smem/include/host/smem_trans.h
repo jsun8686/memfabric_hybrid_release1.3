@@ -30,13 +30,14 @@ extern "C" {
 int32_t smem_trans_config_init(smem_trans_config_t *config);
 
 /**
- * @brief Initialize transfer
+ * @brief Initialize transfer resources
  * all processes need to call this function before creating a trans object
  *
- * @param config           [in] the config for config
+ * @param deviceId         [in] npu device id
+ * @param flags            [in] optional flags
  * @return 0 if successful
  */
-int32_t smem_trans_init(const smem_trans_config_t *config);
+int32_t smem_trans_init(uint32_t deviceId, uint32_t flags);
 
 /**
  * @brief Un-initialize transfer
@@ -46,18 +47,15 @@ int32_t smem_trans_init(const smem_trans_config_t *config);
 void smem_trans_uninit(uint32_t flags);
 
 /**
- * @brief Create a transfer object with config, this transfer need to connect to global config store to exchange
- * inner information for various protocols on different hardware
+ * @brief Create a transfer object with config. A config store server is created on the url
+ * specified by <i>config->url</i> (port 0 means auto detection), then a self connection
+ * is established to exchange inner information for various protocols on different hardware
  *
- * @param storeUrl         [in] the url of config store, e.g. tcp://ip:port, etcd://ip:port,
- *                              etcd://ip:port#instanceId, reg://ip:port,
- *                              or reg://ip:port#instanceId (for multi-cluster isolation).
- *                              The store is created by <i>smem_create_config_store</i>
- * @param uniqueId         [in] unique id for data transfer, which should be unique, a better practice is using ip:port
- * @param config           [in] the config for config
+ * @param config           [in] the config for transfer, url must be set (format: ip:port)
+ * @param flags            [in] optional flags
  * @return transfer object created if successful
  */
-smem_trans_t smem_trans_create(const char *storeUrl, const char *uniqueId, const smem_trans_config_t *config);
+smem_trans_t smem_trans_create(const smem_trans_config_t *config, uint32_t flags);
 
 /**
  * @brief Destroy the transfer created by <i>smem_trans_create</i>
@@ -223,32 +221,38 @@ int32_t smem_trans_batch_write_submit(smem_trans_t handle, const void *localAddr
                                       uint32_t flags);
 
 /**
- * @brief batch write data from local to remote with quantization, only support A3 & dataOpType == SMEMB_DATA_OP_SDMA
- *        now, src data type must is float16 or bfloat16, dest data type is int8
- * @return 0 if successful
-*/
-int32_t smem_trans_batch_quant_write(smem_trans_t handle, smem_trans_quant_copy_param_t *params);
-
-/**
- * @brief Callback type for peer down notification.
- *        Called when a remote peer disconnects or its link is detected as broken.
- *
- * @param peerUniqueId     [in] unique id of the disconnected peer
- * @param userData         [in] user-provided context pointer
- */
-typedef void (*smem_trans_peer_down_callback_t)(const char *peerUniqueId, void *userData);
-
-/**
- * @brief Register a callback to be invoked when a remote peer disconnects.
- *        Only one callback per handle; setting a new one replaces the old.
+ * @brief Submit an asynchronous batch copy task. The task is appended to an inner queue and
+ * executed by a background thread, a unique batch id is generated for status query.
+ * The connection to <i>param->destUrl</i> is created lazily on first copy if not exists
  *
  * @param handle           [in] transfer object handle
- * @param callback         [in] callback function pointer
- * @param userData         [in] opaque user data passed to callback
+ * @param param            [in] batch copy params, opcode distinguishes read/write
+ * @param batchId          [out] unique id of the submitted task
  * @return 0 if successful
  */
-int32_t smem_trans_set_peer_down_callback(smem_trans_t handle, smem_trans_peer_down_callback_t callback,
-                                          void *userData);
+int32_t smem_trans_batch_copy(smem_trans_t handle, smem_trans_batch_params_t *param, uint64_t *batchId);
+
+/**
+ * @brief Query the status of a batch copy task submitted by <i>smem_trans_batch_copy</i>.
+ *        If the task is done, it is removed from the status map
+ *
+ * @param handle           [in] transfer object handle
+ * @param batchId          [in] unique id of the submitted task
+ * @param result           [out] the result of the submitted task
+ * @param flags            [in] optional flags
+ * @return 0 if finished (the task result is written to <i>result</i>), -2015 (SM_NEED_RETRY) if still pending,
+ *         negative error code if the batch id does not exist or other errors happen
+ */
+int32_t smem_trans_batch_status_query(smem_trans_t handle, uint64_t batchId, int32_t *result, uint32_t flags);
+
+/**
+ * @brief Get the actual rpc port of the inner config store server after auto detection
+ *
+ * @param handle           [in] transfer object handle
+ * @param port             [out] actual listening port
+ * @return 0 if successful
+ */
+int32_t smem_trans_get_rpc_port(smem_trans_t handle, uint16_t *port);
 
 #ifdef __cplusplus
 }

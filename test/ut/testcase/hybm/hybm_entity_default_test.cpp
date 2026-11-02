@@ -75,9 +75,6 @@ constexpr int32_t TEST_DEVICE_ID_COPY_NO_GVA = 25024;
 constexpr int32_t TEST_DEVICE_ID_BATCH_NULL = 2503;
 constexpr int32_t TEST_DEVICE_ID_BATCH_SUCCESS = 2504;
 constexpr int32_t TEST_DEVICE_ID_BATCH_FAIL = 2505;
-constexpr int32_t TEST_DEVICE_ID_QUANT_NULL = 2506;
-constexpr int32_t TEST_DEVICE_ID_QUANT_FAIL = 2507;
-constexpr int32_t TEST_DEVICE_ID_QUANT_SUCCESS = 2508;
 constexpr int32_t TEST_DEVICE_ID_WAIT_OP = 2509;
 
 // Test constants for memory sizes
@@ -162,7 +159,7 @@ public:
     {
         return BM_OK;
     }
-    ock::mf::Result Import(const std::vector<std::string> &, void *[]) noexcept override
+    ock::mf::Result Import(const std::vector<std::string> &, void *[], uint32_t) noexcept override
     {
         return BM_OK;
     }
@@ -451,16 +448,6 @@ public:
     ock::mf::Result waitRet{BM_OK};
 };
 
-class FakeDataOperatorQuant : public FakeDataOperator {
-public:
-    ock::mf::Result QuantCopy(hybm_quant_copy_params & /* params */) noexcept override
-    {
-        quantCalled = true;
-        return quantRet;
-    }
-    bool quantCalled{false};
-    ock::mf::Result quantRet{BM_OK};
-};
 } // namespace
 
 // 测试 MemEntityDefault 初始化和反初始化
@@ -1181,61 +1168,6 @@ TEST_F(HybmEntityDefaultTest, BatchCopyData_BatchCopyFail_ReturnErrorCode)
     EXPECT_EQ(ret, BM_ERROR);
 }
 
-TEST_F(HybmEntityDefaultTest, QuantCopy_DataOperatorNull_ReturnError)
-{
-    int32_t deviceId = TEST_DEVICE_ID_QUANT_NULL;
-    ock::mf::MemEntityDefault entity(deviceId);
-    entity.initialized_ = true;
-
-    MOCKER_CPP(&ock::mf::MemEntityDefault::SetThreadAclDevice, int32_t(*)(ock::mf::MemEntityDefault *))
-        .stubs()
-        .will(returnValue(static_cast<int32_t>(BM_OK)));
-
-    hybm_quant_copy_params params{};
-    auto ret = entity.QuantCopy(params);
-    EXPECT_EQ(ret, BM_ERROR);
-}
-
-TEST_F(HybmEntityDefaultTest, QuantCopy_QuantFail_ReturnErrorCode)
-{
-    int32_t deviceId = TEST_DEVICE_ID_QUANT_FAIL;
-    ock::mf::MemEntityDefault entity(deviceId);
-    entity.initialized_ = true;
-
-    MOCKER_CPP(&ock::mf::MemEntityDefault::SetThreadAclDevice, int32_t(*)(ock::mf::MemEntityDefault *))
-        .stubs()
-        .will(returnValue(static_cast<int32_t>(BM_OK)));
-
-    auto dop = std::make_shared<FakeDataOperatorQuant>();
-    dop->quantRet = BM_ERROR;
-    entity.dataOperator_ = dop;
-
-    hybm_quant_copy_params params{};
-    auto ret = entity.QuantCopy(params);
-    EXPECT_EQ(ret, BM_ERROR);
-    EXPECT_TRUE(dop->quantCalled);
-}
-
-TEST_F(HybmEntityDefaultTest, QuantCopy_Success_ReturnOk)
-{
-    int32_t deviceId = TEST_DEVICE_ID_QUANT_SUCCESS;
-    ock::mf::MemEntityDefault entity(deviceId);
-    entity.initialized_ = true;
-
-    MOCKER_CPP(&ock::mf::MemEntityDefault::SetThreadAclDevice, int32_t(*)(ock::mf::MemEntityDefault *))
-        .stubs()
-        .will(returnValue(static_cast<int32_t>(BM_OK)));
-
-    auto dop = std::make_shared<FakeDataOperatorQuant>();
-    dop->quantRet = BM_OK;
-    entity.dataOperator_ = dop;
-
-    hybm_quant_copy_params params{};
-    auto ret = entity.QuantCopy(params);
-    EXPECT_EQ(ret, BM_OK);
-    EXPECT_TRUE(dop->quantCalled);
-}
-
 TEST_F(HybmEntityDefaultTest, Wait_ReturnsDataOperatorWait)
 {
     int32_t deviceId = TEST_DEVICE_ID_WAIT_OP;
@@ -1330,8 +1262,16 @@ TEST_F(HybmEntityDefaultTest, GetSliceVa)
     ock::mf::MemEntityDefault entity(deviceId);
 
     // 测试获取切片虚拟地址（未初始化的情况）
-    void *va = entity.GetSliceVa(nullptr);
+    void *va = entity.GetSliceVa(nullptr, 0);
     EXPECT_EQ(va, nullptr);
+
+    // 测试获取切片 GVA（未初始化的情况）
+    void *gva = entity.GetSliceVa(nullptr, HYBM_GET_SLICE_GVA);
+    EXPECT_EQ(gva, nullptr);
+
+    // 测试非法 flags
+    void *invalid = entity.GetSliceVa(nullptr, 2U);
+    EXPECT_EQ(invalid, nullptr);
 }
 
 // 测试 MemEntityDefault 参数检查

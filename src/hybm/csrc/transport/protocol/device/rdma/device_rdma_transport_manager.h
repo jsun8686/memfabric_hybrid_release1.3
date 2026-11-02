@@ -119,6 +119,7 @@ protected:
     uint32_t rankCount_{1};
     uint32_t deviceId_{0};
     hybm_role_type role_{HYBM_ROLE_PEER};
+    hybm_scene scene_{HYBM_SCENE_DEFAULT};
     in_addr deviceIp_{0};
     uint16_t devicePort_{0};
     void *rdmaHandle_{nullptr};

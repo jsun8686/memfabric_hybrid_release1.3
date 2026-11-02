@@ -49,7 +49,8 @@ public:
     Result AllocLocalMemory(uint64_t size, MemSlicePtr &slice) noexcept override;
     Result Export(std::string &exInfo) noexcept override;
     Result Export(const MemSlicePtr &slice, std::string &exInfo) noexcept override;
-    Result Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept override;
+    Result Import(const std::vector<std::string> &allExInfo, void *addresses[],
+                  uint32_t overrideRank) noexcept override;
     Result Mmap() noexcept override;
     Result Unmap() noexcept override;
     MemSlicePtr GetMemSlice(hybm_mem_slice_t slice, bool quiet) const noexcept override;

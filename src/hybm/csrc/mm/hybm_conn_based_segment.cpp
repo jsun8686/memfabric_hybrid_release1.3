@@ -203,8 +203,10 @@ Result HybmConnBasedSegment::Export(const MemSlicePtr &slice, std::string &exInf
     return BM_OK;
 }
 
-Result HybmConnBasedSegment::Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept
+Result HybmConnBasedSegment::Import(const std::vector<std::string> &allExInfo, void *addresses[],
+                                    uint32_t overrideRank) noexcept
 {
+    (void)overrideRank; // rank 覆盖仅 trans 场景（AsymmetricMemSegment）需要
     LiteralExInfoTranslater<HostExportInfo> translator;
     std::vector<HostExportInfo> deserializedInfos{allExInfo.size()};
     for (auto i = 0U; i < allExInfo.size(); i++) {

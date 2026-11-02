@@ -295,7 +295,7 @@ int32_t FakeAclrtMemcpyOk(void *dst, size_t dstSize, const void *src, size_t src
 
 class FakeQpManager final : public DeviceQpManager {
 public:
-    FakeQpManager() : DeviceQpManager(0, 0, 1, sockaddr_in{}, HYBM_ROLE_PEER) {}
+    FakeQpManager() : DeviceQpManager(0, 0, 1, sockaddr_in{}, HYBM_SCENE_DEFAULT) {}
 
     int SetRemoteRankInfo(const std::unordered_map<uint32_t, ConnectRankInfo> &) noexcept override
     {
@@ -374,7 +374,7 @@ std::shared_ptr<AicpuJoinableRanksQpManager> MakeAiQpManager(uint32_t rankCount,
     net.sin_family = AF_INET;
     net.sin_port = htons(8000);
     inet_pton(AF_INET, "127.0.0.1", &net.sin_addr);
-    return std::make_shared<AicpuJoinableRanksQpManager>(0, 0, rankId, rankCount, net, HYBM_ROLE_PEER);
+    return std::make_shared<AicpuJoinableRanksQpManager>(0, 0, rankId, rankCount, net, HYBM_SCENE_DEFAULT);
 }
 
 void AddAiQpInfo(const std::shared_ptr<AicpuJoinableRanksQpManager> &mgr, uint32_t rankId, uint32_t dbIndex)

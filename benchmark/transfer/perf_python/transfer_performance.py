@@ -253,6 +253,13 @@ def trans_perf_test(rank_id, store_url, num_threads=1, data_op_type=None, npu_id
         # Sync barrier before cleanup
         shm_handle.barrier()
 
+        # rank 0 is the only side that connects to rank 1, so it must leave rank 1's trans store
+        # before rank 1 tears that store down; the barrier below orders the leave ahead of rank 1
+        # reaching its own trans teardown
+        if rank_id == 0:
+            engine.destroy()
+        shm_handle.barrier()
+
     except Exception as e:
         print(f"Error in trans_perf_test: {e}")
         import traceback
@@ -284,7 +291,7 @@ def main():
         default='tcp://127.0.0.1:12050',
         help='Config store URL (default: tcp://127.0.0.1:12050)',
     )
-    parser.add_argument('--num-threads', type=int, default=1, help='Number of concurrent threads (default: 2)')
+    parser.add_argument('--num-threads', type=int, default=2, help='Number of concurrent threads (default: 2)')
     parser.add_argument(
         '--data-op-type',
         type=str,

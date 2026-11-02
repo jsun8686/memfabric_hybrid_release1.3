@@ -1000,6 +1000,15 @@ Result HcomTransportManager::BindServiceWithPortRetry()
     return BM_DL_FUNCTION_FAILED;
 }
 
+// HCOM payload 里 client=建链发起方自己的 rank、server=发起方视角下的目标 rank（见 ConnectHcomChannel）。
+// 两端最终都要用「本端 rank 空间里的对端编号」给 channels_ 记账：被连接的一端本端 rank 恰为 payload.server，
+// 此时对端编号是 payload.client；其余情况（主动端/编号重合）用 payload.server。trans 场景下发起端 entity
+// rank 与对端 override rank 不再相等，必须按此规则换算，否则被连接端把 channel 记到错误下标而等待超时。
+static uint32_t PeerRankFromPayload(uint32_t localRankId, const HcomPayload &payload)
+{
+    return localRankId == payload.server ? payload.client : payload.server;
+}
+
 Result HcomTransportManager::OnNewEndPoint(Hcom_Channel newCh, const char *payLoad)
 {
     const char *logPayLoad = (payLoad != nullptr) ? payLoad : "<null>";
@@ -1014,9 +1023,10 @@ Result HcomTransportManager::OnNewEndPoint(Hcom_Channel newCh, const char *payLo
     payloadUn.payload = payloadNum;
     BM_LOG_DEBUG("new channel from " << payloadUn.client << " to " << payloadUn.server);
 
-    auto rankId = payloadUn.client;
+    auto rankId = PeerRankFromPayload(rankId_, payloadUn);
     if (rankId >= channelMutex_.size()) {
-        BM_LOG_ERROR("New hcom ch with invalid rankId: " << rankId << " payLoad: " << logPayLoad);
+        BM_LOG_ERROR("New hcom ch with invalid rankId: " << rankId << " local rank: " << rankId_
+                                                         << " payLoad: " << logPayLoad);
         return BM_ERROR;
     }
     std::unique_lock<std::mutex> locker{channelMutex_[rankId]};
@@ -1040,7 +1050,7 @@ Result HcomTransportManager::OnEndPointBroken(Hcom_Channel ch, const char *payLo
     payloadUn.payload = payloadNum;
     BM_LOG_DEBUG("channel: " << ch << " broken from " << payloadUn.client << " to " << payloadUn.server);
 
-    auto rankId = rankId_ == payloadUn.server ? payloadUn.client : payloadUn.server;
+    auto rankId = PeerRankFromPayload(rankId_, payloadUn);
     HcomChannelDisconnected(rankId, ch);
     return BM_OK;
 }
@@ -1085,8 +1095,8 @@ Result HcomTransportManager::ConnectHcomChannel(uint32_t rankId, const std::stri
         options.linkCount = HCOM_TRANS_EP_SIZE;
     }
     HcomPayload payload{};
-    payload.client = rankId_;
-    payload.server = rankId;
+    payload.client = rankId_; // 发起方（本端）rank，接收方用它换算对端编号（见 PeerRankFromPayload）
+    payload.server = rankId; // 本端视角下的目标 rank
     auto rankIdStr = std::to_string(payload.payload);
     std::copy_n(rankIdStr.c_str(), rankIdStr.size() + 1, options.payLoad);
     do {

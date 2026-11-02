@@ -96,8 +96,8 @@ int QpCreator::Create(void *rdmaHandle, int flag, int qpMode, void *&qpHandle) n
 }
 
 JoinableRanksQpManager::JoinableRanksQpManager(uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId,
-                                               uint32_t rankCount, sockaddr_in devNet, hybm_role_type role) noexcept
-    : DeviceQpManager(deviceId, rankId, rankCount, devNet, role)
+                                               uint32_t rankCount, sockaddr_in devNet, hybm_scene scene) noexcept
+    : DeviceQpManager(deviceId, rankId, rankCount, devNet, scene)
 {
     connections_.resize(rankCount);
     qpArray_.resize(rankCount, nullptr);
@@ -438,7 +438,7 @@ int JoinableRanksQpManager::WaitSocketConnections(const std::set<uint32_t> &newR
         info.remoteIp.addr = connections_[rankId].remoteNet.sin_addr;
         info.status = 0;
         bzero(info.tag, sizeof(info.tag));
-        FillHccpTag(info.tag, rankId);
+        FillHccpTag(info.tag, rankId, connections_[rankId].remoteNet);
         socketInfos.push_back(info);
         socketKeyToRank.emplace(std::make_pair(info.remoteIp.addr.s_addr, std::string(info.tag)), rankId);
     }
@@ -702,7 +702,7 @@ int JoinableRanksQpManager::GenerateWhiteList(const std::set<uint32_t> &newClien
         info.remoteIp.addr = connections_[rankId].remoteNet.sin_addr;
         info.connLimit = rankCount_;
         bzero(info.tag, sizeof(info.tag));
-        FillHccpTag(info.tag, rankId);
+        FillHccpTag(info.tag, rankId, connections_[rankId].remoteNet);
         whitelist.emplace_back(info);
         whitelistRanks.emplace_back(rankId);
     }
@@ -785,7 +785,7 @@ int JoinableRanksQpManager::CreateConnectionToServers(const std::set<uint32_t> &
         connectInfo.remoteIp.addr = connections_[rankId].remoteNet.sin_addr;
         connectInfo.port = connections_[rankId].remoteNet.sin_port;
         bzero(connectInfo.tag, sizeof(connectInfo.tag));
-        FillHccpTag(connectInfo.tag, rankId);
+        FillHccpTag(connectInfo.tag, rankId, connections_[rankId].remoteNet);
         BM_LOG_DEBUG("add connecting server " << connectInfo);
         connectInfos.emplace_back(connectInfo);
         connectRanks.emplace_back(rankId);
@@ -896,7 +896,7 @@ void JoinableRanksQpManager::DeleteWhiteList(const std::map<uint32_t, Connection
         info.remoteIp.addr = it->second.remoteNet.sin_addr;
         info.connLimit = 0;
         bzero(info.tag, sizeof(info.tag));
-        FillHccpTag(info.tag, it->first);
+        FillHccpTag(info.tag, it->first, it->second.remoteNet);
         whitelist.emplace_back(info);
     }
 
@@ -918,17 +918,28 @@ void JoinableRanksQpManager::DeleteWhiteList(const std::map<uint32_t, Connection
     }
 }
 
-void JoinableRanksQpManager::FillHccpTag(char *output, uint32_t peerRank)
+void JoinableRanksQpManager::FillHccpTag(char *output, uint32_t peerRank, const sockaddr_in &peerNet)
 {
     static constexpr const char *bmTag = "BM_TAG";
     static constexpr const char *undefineTag = "UNDEFINE_TAG";
 
-    if (rankRole_ == HYBM_ROLE_PEER) {
+    // 判据由 rankRole 改为 scene：BM 场景（HYBM_SCENE_DEFAULT，原 HYBM_ROLE_PEER）各 rank 共用固定 tag；
+    // TRANS 场景（原 HYBM_ROLE_SENDER / HYBM_ROLE_RECEIVER）下同一 IP 可承载多个实例（端口不同），
+    // 仅用 rank 对无法区分，故追加 server 侧（rank 较小端，即 RA server / 白名单侧）的 ip 与端口；
+    // 该地址两端均可知（本端 deviceAddress_、对端 peerNet），保证两端算出的 tag 完全一致；
+    // 其余场景无从判定。RA 侧按 (clientIp, tag) 匹配白名单，两端 tag 必须相同
+    if (scene_ == HYBM_SCENE_DEFAULT) {
         std::snprintf(output, HCCP_SOCK_CONN_TAG_SIZE, "%s", bmTag);
-    } else if (rankRole_ == HYBM_ROLE_SENDER || rankRole_ == HYBM_ROLE_RECEIVER) {
-        uint32_t firstRank = std::min(rankId_, peerRank);
-        uint32_t secondRank = std::max(rankId_, peerRank);
-        std::snprintf(output, HCCP_SOCK_CONN_TAG_SIZE, "TRANS_TAG_%u_%u", firstRank, secondRank);
+    } else if (scene_ == HYBM_SCENE_TRANS) {
+        const sockaddr_in &serverNet = (rankId_ < peerRank) ? deviceAddress_ : peerNet;
+        char serverIp[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, &serverNet.sin_addr, serverIp, sizeof(serverIp)) == nullptr) {
+            BM_LOG_ERROR("fill hccp tag failed: inet_ntop failed, errno: " << errno << ", rankId: " << rankId_
+                                                                           << ", peerRank: " << peerRank);
+            std::snprintf(output, HCCP_SOCK_CONN_TAG_SIZE, "%s", undefineTag);
+            return;
+        }
+        std::snprintf(output, HCCP_SOCK_CONN_TAG_SIZE, "TRANS_TAG_%s_%u", serverIp, serverNet.sin_port);
     } else {
         std::snprintf(output, HCCP_SOCK_CONN_TAG_SIZE, "%s", undefineTag);
     }

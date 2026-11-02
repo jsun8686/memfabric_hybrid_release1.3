@@ -23,6 +23,8 @@ typedef void *hybm_entity_t;
 typedef void *hybm_mem_slice_t;
 
 #define HYBM_FLAG_EXPORT_ENTITY 1U ///< export/import entity instead of slice
+// hybm_get_slice_va 时返回 slice 的 GVA（全局虚拟地址）而非本地虚拟地址
+#define HYBM_GET_SLICE_GVA 1U
 
 #define HYBM_TLS_PATH_SIZE 256
 // HYBM_BIND_NUMA_FLAG start index When HYBM_PERFORMANCE_MODE_FLAG_INDEX == 1, this field is used
@@ -32,7 +34,24 @@ typedef void *hybm_mem_slice_t;
 #define HYBM_PERFORMANCE_MODE_FLAG_LEN   1
 // Automatic NUMA affinity selection when HYBM_BIND_NUMA_FLAG == HYBM_BIND_NUMA_AUTO_AFFINITY_FLAG
 #define HYBM_BIND_NUMA_AUTO_AFFINITY_FLAG ((1U << HYBM_BIND_NUMA_FLAG_LEN) - 1)
-#define HYBM_FLAG_CREATE_WITH_SHM         (1U << 8)
+// hybm_import 时用本地分配的 rankId 覆盖 exchange info 中的 rankId（trans 场景：
+// 单 entity 多连接，每个 uniqueId 连接在导入时映射到本地唯一的覆盖 rank 窗口）
+#define HYBM_FLAG_IMPORT_RANK_OVERRIDE (1U << 13)
+// 覆盖 rankId 编码在 flags 的 bit16..bit31（预留低 16 位给功能开关）
+#define HYBM_IMPORT_RANK_FLAG_INDEX 16U
+#define HYBM_IMPORT_RANK_FLAG_LEN   16U
+#define HYBM_IMPORT_RANK_MASK       ((1U << HYBM_IMPORT_RANK_FLAG_LEN) - 1U)
+// 无效/未指定的覆盖 rankId：uint32_t 最大值。编码时收到该值不置任何覆盖位（等价于不覆盖），
+// 解码时未使能覆盖即得到该值；0 是合法的覆盖 rank
+#define HYBM_IMPORT_RANK_INVALID UINT32_MAX
+#define HYBM_IMPORT_RANK_ENCODE(rank)     \
+    (((rank) == HYBM_IMPORT_RANK_INVALID) \
+         ? 0U                             \
+         : (HYBM_FLAG_IMPORT_RANK_OVERRIDE | (((rank) & HYBM_IMPORT_RANK_MASK) << HYBM_IMPORT_RANK_FLAG_INDEX)))
+#define HYBM_IMPORT_RANK_DECODE(flags)  (((flags) >> HYBM_IMPORT_RANK_FLAG_INDEX) & HYBM_IMPORT_RANK_MASK)
+#define HYBM_IMPORT_RANK_ENABLED(flags) (((flags) & HYBM_FLAG_IMPORT_RANK_OVERRIDE) != 0U)
+
+#define HYBM_FLAG_CREATE_WITH_SHM (1U << 8)
 // HYBM_FLAG_DRAM_MAP_HOST_VA map host virtual address space
 #define HYBM_FLAG_DRAM_MAP_HOST_VA (1U << 9)
 // HYBM_FLAG_UNRESTRICTED_MEM mem_type == MEM_DDR_TYPE, pg_type == MEM_HUGE_PAGE_TYPE
@@ -185,19 +204,6 @@ typedef struct {
     const uint64_t *dataSizes;
     uint32_t batchSize;
 } hybm_batch_copy_params;
-
-typedef struct {
-    void **sources;
-    void **destinations;
-    const uint64_t *dataSizes;
-    void **scale;  /* quant scale */
-    void **offset; /* quant offset */
-    uint32_t batchSize;
-    uint32_t unitNum; /* pretoken tensor size */
-    void *stream;
-    uint32_t inputType; /* inputType = 0, input type is bfloat16; inputType = 1, input type is float16 */
-    uint32_t flags;
-} hybm_quant_copy_params;
 
 #ifndef __cplusplus
 }

@@ -91,9 +91,10 @@ int32_t hybm_free_local_memory(hybm_entity_t e, hybm_mem_slice_t slice, uint32_t
  *
  * @param e                [in] entity created by hybm_create_entity
  * @param slice             [in] mf slice ptr
+ * @param flags            [in] 0: get local virtual address, HYBM_GET_SLICE_GVA: get global virtual address
  * @return non-null pointer to the virtual address of the slice or fail
  */
-void *hybm_get_slice_va(hybm_entity_t e, hybm_mem_slice_t slice);
+void *hybm_get_slice_va(hybm_entity_t e, hybm_mem_slice_t slice, uint32_t flags);
 
 /**
  * @brief get size from slice

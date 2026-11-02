@@ -512,8 +512,10 @@ Result HybmVmmBasedSegment::GetExportSliceSize(size_t &size) noexcept
     return BM_OK;
 }
 
-Result HybmVmmBasedSegment::Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept
+Result HybmVmmBasedSegment::Import(const std::vector<std::string> &allExInfo, void *addresses[],
+                                   uint32_t overrideRank) noexcept
 {
+    (void)overrideRank; // rank 覆盖仅 trans 场景（AsymmetricMemSegment）需要
     LiteralExInfoTranslater<HostSdmaExportInfo> translator;
     uint64_t exportMagic = (options_.segType == HYBM_MST_DRAM) ? VMM_BASE_DRAM_SLICE_EXPORT_INFO_MAGIC
                                                                : VMM_BASE_HBM_SLICE_EXPORT_INFO_MAGIC;

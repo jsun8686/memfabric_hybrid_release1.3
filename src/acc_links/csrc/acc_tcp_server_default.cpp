@@ -508,11 +508,28 @@ void AccTcpServerDefault::WorkerLinkCntUpdate(uint32_t workerIdx)
     return;
 }
 
+namespace {
+// 依据对端 ip:port 构造 URL，IPv6 需加方括号，保证解析出的地址族与对端一致。
+std::string BuildPeerUrl(const std::string &ip, uint16_t port)
+{
+    if (ip.find(':') != std::string::npos && (ip.empty() || ip.front() != '[')) {
+        return "tcp://[" + ip + "]:" + std::to_string(port);
+    }
+    return "tcp://" + ip + ":" + std::to_string(port);
+}
+} // namespace
+
 Result AccTcpServerDefault::ConnectToPeerServer(const std::string &peerIp, uint16_t port, const AccConnReq &req,
                                                 uint32_t maxRetryTimes, AccTcpLinkComplexPtr &newLink)
 {
-    auto parser = mf::SocketAddressParserMgr::getInstance().GetParser(port);
-    ASSERT_RETURN(parser != nullptr, ACC_ERROR);
+    // 必须按对端 ip:port 创建 parser：客户端进程从未为该 ip:port 注册过 parser，按端口取会拿到
+    // nullptr；HA 主备场景下同一端口还可能先后对应不同 IP 的 parser。parser 管理器按完整 url
+    // （ip+port）缓存，按对端 ip:port 创建既能保证地址族正确，也无需调用方预先注册。
+    auto parser = mf::SocketAddressParserMgr::getInstance().CreateParser(BuildPeerUrl(peerIp, port));
+    if (parser == nullptr) {
+        LOG_ERROR("Failed to create address parser, peerIp: " << peerIp << ", port: " << port);
+        return ACC_ERROR;
+    }
     if (!parser->IsIpv6()) {
         ASSERT_RETURN(AccCommonUtil::IsValidIPv4(peerIp), ACC_ERROR);
     }

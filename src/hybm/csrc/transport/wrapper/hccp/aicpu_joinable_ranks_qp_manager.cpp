@@ -63,8 +63,8 @@ uint32_t GetDepthFromEnv(const std::string &envName, uint32_t defaultValue, uint
 
 AicpuJoinableRanksQpManager::AicpuJoinableRanksQpManager(uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId,
                                                          uint32_t rankCount, sockaddr_in devNet,
-                                                         hybm_role_type role) noexcept
-    : JoinableRanksQpManager(userDeviceId, deviceId, rankId, rankCount, devNet, role)
+                                                         hybm_scene scene) noexcept
+    : JoinableRanksQpManager(userDeviceId, deviceId, rankId, rankCount, devNet, scene)
 {
     sendWrDepth_ = GetDepthFromEnv(env::MF_NPU_RDMA_MAX_SEND_WR, AI_MAX_SEND_WR, AI_WR_DEPTH_MIN, AI_WR_DEPTH_MAX);
 }

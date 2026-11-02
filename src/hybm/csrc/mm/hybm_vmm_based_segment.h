@@ -56,7 +56,8 @@ public:
     Result Export(std::string &exInfo) noexcept override;
     Result Export(const MemSlicePtr &slice, std::string &exInfo) noexcept override;
     Result GetExportSliceSize(size_t &size) noexcept override;
-    Result Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept override;
+    Result Import(const std::vector<std::string> &allExInfo, void *addresses[],
+                  uint32_t overrideRank) noexcept override;
     Result RemoveImported(const std::vector<uint32_t> &ranks) noexcept override;
     Result Mmap() noexcept override;
     Result Unmap() noexcept override;

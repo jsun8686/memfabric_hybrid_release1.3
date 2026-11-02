@@ -28,8 +28,8 @@ sockaddr_in Ip2Net(in_addr ip)
 }
 
 DeviceQpManager::DeviceQpManager(uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet,
-                                 hybm_role_type role) noexcept
-    : deviceId_{deviceId}, rankId_{rankId}, rankCount_{rankCount}, deviceAddress_{devNet}, rankRole_{role}
+                                 hybm_scene scene) noexcept
+    : deviceId_{deviceId}, rankId_{rankId}, rankCount_{rankCount}, deviceAddress_{devNet}, scene_{scene}
 {}
 
 int DeviceQpManager::WaitingConnectionReady() noexcept

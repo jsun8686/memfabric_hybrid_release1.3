@@ -54,14 +54,15 @@ G2G: copy data from global memory space to global memory space
 
 **C接口使用方式**
 
-1. 调用smem_trans_init接口初始化。
-2. 调用smem_trans_create接口创建实例。
-3. 调用smem_trans_register_mem接口将内存注册给memfabric，然后调用smem_trans_write或smem_trans_read接口进行传输。
+1. 调用smem_trans_config_init初始化配置，并设置`config.url`（本实例唯一标识，格式`ip:port`；端口填`0`表示自动选择可用端口，可用smem_trans_get_rpc_port获取真实端口）。
+2. 调用smem_trans_init接口初始化（入参为deviceId）。
+3. 调用smem_trans_create接口创建实例，实例内部会按`config.url`创建自己的config store服务端，无需调用方提前创建config store。
+4. 调用smem_trans_register_mem接口将内存注册给memfabric，然后调用smem_trans_write或smem_trans_read接口进行传输；异步批量拷贝场景使用smem_trans_batch_copy提交任务、smem_trans_batch_status_query查询完成状态。
 
 **Python接口使用方式**
 
 1. 调用memfabric_hybrid.TransferEngine接口创建engine。
-2. 调用engine.initialize接口初始化。
+2. 调用engine.initialize接口初始化（`session_id`同时是本实例内部config store的监听地址，`store_url`为兼容参数，当前版本不再参与对端发现）。
 3. 调用engine.register_memory接口将内存注册给memfabric，然后调用engine.transfer_sync_write接口进行传输。
 
 ## 3. Share Memory（SHM）

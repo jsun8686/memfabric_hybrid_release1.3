@@ -54,14 +54,15 @@ struct TransportOptions {
     uint32_t protocol;
     hybm_type initialType;
     hybm_role_type role;
+    hybm_scene scene{HYBM_SCENE_DEFAULT}; // 场景，传输层据此区分 BM / TRANS 等建链语义
     std::string nic;
     hybm_tls_config tlsOption;
 };
 
 static inline std::ostream &operator<<(std::ostream &output, const TransportOptions &options)
 {
-    output << "TransportOptions(rankId=" << options.rankId << ", count=" << options.rankCount << ", nic=" << options.nic
-           << ")";
+    output << "TransportOptions(rankId=" << options.rankId << ", count=" << options.rankCount
+           << ", scene=" << options.scene << ", nic=" << options.nic << ")";
     return output;
 }
 

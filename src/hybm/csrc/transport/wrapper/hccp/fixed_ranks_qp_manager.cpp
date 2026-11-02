@@ -30,7 +30,7 @@ constexpr uint32_t CQ_CUSTOM_FLAG = 1;
 constexpr int COPY_INFO_SL = 4;
 FixedRanksQpManager::FixedRanksQpManager(uint32_t deviceId, uint32_t rankId, uint32_t rankCount,
                                          sockaddr_in devNet) noexcept
-    : DeviceQpManager(deviceId, rankId, rankCount, devNet, HYBM_ROLE_PEER)
+    : DeviceQpManager(deviceId, rankId, rankCount, devNet, HYBM_SCENE_DEFAULT)
 {}
 
 FixedRanksQpManager::~FixedRanksQpManager() noexcept

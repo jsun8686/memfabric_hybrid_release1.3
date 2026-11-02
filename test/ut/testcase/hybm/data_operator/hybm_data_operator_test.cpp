@@ -25,14 +25,6 @@ public:
     };
 };
 
-TEST_F(HybmDataOperatorTest, quant_copy_test)
-{
-    ock::mf::DataOperatorPtr opPtr = std::make_shared<ock::mf::HostDataOpSDMA>();
-    hybm_quant_copy_params param;
-    auto ret = opPtr->ock::mf::DataOperator::QuantCopy(param);
-    ASSERT_EQ(BM_NOT_SUPPORTED, ret);
-}
-
 TEST_F(HybmDataOperatorTest, update_gva_space_test)
 {
     ock::mf::DataOperatorPtr opPtr = std::make_shared<ock::mf::HostDataOpSDMA>();
@@ -44,13 +36,6 @@ TEST_F(HybmDataOperatorTest, clean_up_test)
 {
     ock::mf::DataOperatorPtr opPtr = std::make_shared<ock::mf::HostDataOpSDMA>();
     opPtr->ock::mf::DataOperator::CleanUp();
-}
-
-TEST_F(HybmDataOperatorTest, quant_copy_default_returns_not_supported)
-{
-    ock::mf::DataOperatorPtr opPtr = std::make_shared<ock::mf::HostDataOpSDMA>();
-    hybm_quant_copy_params param{};
-    EXPECT_EQ(opPtr->ock::mf::DataOperator::QuantCopy(param), BM_NOT_SUPPORTED);
 }
 
 TEST_F(HybmDataOperatorTest, update_gva_space_unknown_type)

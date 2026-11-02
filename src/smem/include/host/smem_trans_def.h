@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define SMEM_TRANS_RANK_COUNT_MAX (512U)
+#define SMEM_TRANS_RANK_COUNT_MAX (1024U)
 
 typedef void *smem_trans_t;
 
@@ -44,22 +44,31 @@ typedef struct {
     uint32_t flags;                  /* optional flags */
     smem_bm_data_op_type dataOpType; /* data operation type; see smem_bm_data_op_type */
     char nic[64];                    /* host NIC addr for host_rdma, format: tcp://ip:port */
+    char url[64];                    /* unique id of this instance, format: ip:port, port 0 means auto detection */
     smem_tls_config hcomTlsConfig;   /* hcom TLS config for host_rdma */
 } smem_trans_config_t;
 
+/**
+ * @brief Batch copy operation type, i.e. read/write
+ */
+typedef enum {
+    SMEM_TRANS_OP_READ = 0,  /* read data from remote to local */
+    SMEM_TRANS_OP_WRITE = 1, /* write data from local to remote */
+} smem_trans_opcode_t;
+
+/**
+ * @brief Asynchronous batch copy params, submitted by smem_trans_batch_copy
+ */
 typedef struct {
-    const char *remoteUniqueId;
-    void **localAddrs;
-    void **remoteAddrs;
-    size_t *dataSizes;
-    float **scale;  /* quant scale which is address of the remote uniqueId */
-    float **offset; /* quant offset which is address of the remote uniqueId */
-    uint32_t batchSize;
-    uint32_t unitNum;   /* pretoken tensor size */
-    void *stream;       /* if stream != null, submit task on this stream async */
-    uint32_t inputType; /* inputType = 0, input type is bfloat16; inputType = 1, input type is float16 */
-    uint32_t flags;     /* unused */
-} smem_trans_quant_copy_param_t;
+    const char *destUrl;        /* remote unique id, format: ip:port */
+    void **srcList;             /* WRITE: local source addrs; READ: local received addrs */
+    void **destList;            /* WRITE: remote target addrs; READ: remote source addrs */
+    size_t *sizeList;           /* byte counts of each batch copy */
+    uint32_t batchSize;         /* number of batch copy tasks */
+    smem_trans_opcode_t opcode; /* distinguishes read/write */
+    void *stream;               /* if not null, submit task on this stream async */
+    uint32_t flags;             /* reserved flags */
+} smem_trans_batch_params_t;
 
 #ifdef __cplusplus
 }

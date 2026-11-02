@@ -703,11 +703,17 @@ TEST(HcomTransportManagerTest, NewEndPointCallbackHandlesNullAndNonNull)
     EXPECT_NE(mgr->OnNewEndPoint(dummyCh, nullptr), BM_OK);
     EXPECT_NE(mgr->OnNewEndPoint(dummyCh, "test_payload"), BM_OK);
 
+    // payload "0": client=0, server=0; local rank(UINT32_MAX) != server -> peer index = server = 0
     EXPECT_EQ(mgr->OnNewEndPoint(dummyCh, "0"), BM_OK);
     EXPECT_EQ(mgr->channels_[0], dummyCh);
 
-    // payload client=1 exceeds rankCount_=1 -> rejected
-    EXPECT_NE(mgr->OnNewEndPoint(dummyCh, "1"), BM_OK);
+    // payload "4294967296": client=0, server=1 -> peer index = server = 1, exceeds rankCount_=1 -> rejected
+    EXPECT_NE(mgr->OnNewEndPoint(dummyCh, "4294967296"), BM_OK);
+
+    // local rank equals payload.server -> peer index = payload.client = 0, still valid
+    mgr->rankId_ = 1;
+    EXPECT_EQ(mgr->OnNewEndPoint(dummyCh, "4294967296"), BM_OK);
+    EXPECT_EQ(mgr->channels_[0], dummyCh);
 }
 
 // EndPointBroken: invalid payload (null / non-number) returns BM_ERROR.

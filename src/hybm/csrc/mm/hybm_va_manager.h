@@ -143,7 +143,6 @@ struct GvaReserveOptions {
     hybm_mem_type memType{HYBM_MEM_TYPE_DEVICE}; // memory type of the reserved range
     bool enable56BitsGva{false};                 // reserve in the 56-bit GVA area
     hybm_scene scene{HYBM_SCENE_DEFAULT};        // selects the GVA area, differs for HYBM_SCENE_TRANS
-    uint64_t expectAddr{0};                      // 0 takes the first fit, otherwise that exact window base
 };
 
 // Reserved virtual address ranges; GVA ranges of all types must not overlap.
@@ -321,13 +320,16 @@ public:
     Result AddVaInfo(const BaseAllocatedGvaInfo &baseInfo, bool onlyGva = false,
                      AddressOwnership ownership = AddressOwnership::Local);
     Result AddVaInfo(const AllocatedGvaInfo &info, bool onlyGva = false);
-    void RemoveOneVaInfo(uint64_t va, uint32_t type = HVM_GVA);
+    // 注销记录：按记录内容逐表递减行引用计数。仅当本次注销涉及的所有行都因计数归零被回收
+    // （即无其他记录存活引用）时返回 true；记录不存在、参数无效或任一行仍有存活引用时返回 false。
+    // 持有共享资源（如 host 设备映射）的调用方应仅在返回 true 时释放资源
+    bool RemoveOneVaInfo(uint64_t va, uint32_t type = HVM_GVA);
 
     // 精确注销：按调用方记录在 AddVaInfo 时登记的 key 逐表递减引用计数，归零回收行。
     // 同 gva 的 imported 记录共存（多 store 组窗口号撞车）时，各行 content 是最后写者，
     // 单 key 级联会误删共存方的 DVA 行，此类调用方（如 trans 导入卸载）必须使用本重载。
-    // key 为 0 表示该表无行，跳过。
-    void RemoveOneVaInfo(uint64_t gva, uint64_t dva, uint64_t hva);
+    // key 为 0 表示该表无行，跳过。返回值语义同上：所有涉及行均归零回收才返回 true
+    bool RemoveOneVaInfo(uint64_t gva, uint64_t dva, uint64_t hva);
 
     // Returns 0 if not found.
     uint64_t TransformVa(uint64_t va, uint32_t inputType, uint32_t outputType);
@@ -417,8 +419,8 @@ private:
     // 行引用计数递增：行已存在（新的共存记录）则 ++，否则初始化为 1（调用方须已持有 mutex_）
     void AddRowRef(uint32_t type, uint64_t key);
 
-    // 行引用计数递减：归零回收行与计数；行/计数不存在时静默跳过（如 onlyGva 记录无 DVA/HVA 行）
-    void RemoveRowRef(uint32_t type, uint64_t key);
+    // 行引用计数递减：归零回收行与计数并返回 true；行/计数不存在或归零后仍有存活引用时返回 false
+    bool RemoveRowRef(uint32_t type, uint64_t key);
 
     uint64_t AllocReserveLvaInner(uint64_t size, uint32_t type, hybm_scene scene = HYBM_SCENE_DEFAULT);
 

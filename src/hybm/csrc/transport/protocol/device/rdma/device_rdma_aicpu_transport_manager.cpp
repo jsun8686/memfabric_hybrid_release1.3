@@ -144,6 +144,7 @@ Result RdmaAicpuTransportManager::InitDeviceContext(const TransportOptions &opti
     rankCount_ = options.rankCount;
     qpReadyCache_.reset(new std::atomic<bool>[rankCount_]());
     role_ = options.role;
+    scene_ = options.scene;
     ret = ParseDeviceNic(options.nic, devicePort_);
     BM_ASSERT_LOG_AND_RETURN(ret == BM_OK, "parse input nic(" << options.nic << ") failed!", BM_INVALID_PARAM);
     return BM_OK;
@@ -175,7 +176,7 @@ Result RdmaAicpuTransportManager::OpenDevice(const TransportOptions &options)
     deviceAddr.sin_port = devicePort_;
     BM_LOG_INFO("use aicpu joinable ranks qp manager, rankId: " << rankId_ << " rankCount: " << rankCount_);
     qpManager_ =
-        std::make_shared<AicpuJoinableRanksQpManager>(userId, deviceId_, rankId_, rankCount_, deviceAddr, role_);
+        std::make_shared<AicpuJoinableRanksQpManager>(userId, deviceId_, rankId_, rankCount_, deviceAddr, scene_);
 
     auto loadRet = LoadDeviceKernelAndGetHandles(aicpuRdmaBin_, aicpuRdmaPostSend_, "HybmRdmaAicpuPostSend");
     if (loadRet != BM_OK) {

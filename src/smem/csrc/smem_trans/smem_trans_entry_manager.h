@@ -27,17 +27,15 @@ public:
     ~SmemTransEntryManager() = default;
 
     void UnInitialize();
-    Result CreateEntryByName(const std::string &name, const std::string &storeUrl, const smem_trans_config_t &config,
-                             SmemTransEntryPtr &entry);
+    Result CreateEntry(const smem_trans_config_t &config, SmemTransEntryPtr &entry);
+    Result AllocEntityId(uint32_t &entityId);
     Result GetEntryByPtr(uintptr_t ptr, SmemTransEntryPtr &entry);
     Result RemoveEntryByPtr(uintptr_t ptr);
 
 private:
     std::mutex entryMutex_;
-    std::map<uintptr_t, SmemTransEntryPtr> ptr2EntryMap_;    /* lookup entry by ptr */
-    std::map<std::string, SmemTransEntryPtr> name2EntryMap_; /* deduplicate entry by name */
-    uint16_t deviceId_{0};
-    uint32_t entryIdx_{0};
+    std::map<uintptr_t, SmemTransEntryPtr> ptr2EntryMap_; /* lookup entry by ptr */
+    uint32_t entryIdx_{0};                                /* process-level entity id allocator */
 };
 } // namespace smem
 } // namespace ock

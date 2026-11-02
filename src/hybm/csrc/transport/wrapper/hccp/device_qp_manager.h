@@ -58,7 +58,7 @@ struct ConnectionChannel {
 class DeviceQpManager {
 public:
     DeviceQpManager(uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet,
-                    hybm_role_type role) noexcept;
+                    hybm_scene scene) noexcept;
     virtual ~DeviceQpManager() = default;
 
     virtual int SetRemoteRankInfo(const std::unordered_map<uint32_t, ConnectRankInfo> &ranks) noexcept = 0;
@@ -85,7 +85,7 @@ protected:
     const uint32_t deviceId_;
     const uint32_t rankId_;
     const uint32_t rankCount_;
-    const hybm_role_type rankRole_;
+    const hybm_scene scene_;
     sockaddr_in deviceAddress_;
     void *serverSocketHandle_{nullptr};
 };

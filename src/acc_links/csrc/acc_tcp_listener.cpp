@@ -44,9 +44,9 @@ Result AccTcpListener::Start() noexcept
 
     VALIDATE_RETURN(connHandler_ != nullptr, "connection handler not initialized", ACC_ERROR);
 
-    // 必须按本 listener 的 ip:port 解析地址，不能复用 GetParser(port) 的端口缓存：
-    // HA 主备场景下同一端口会先后出现不同 IP 的 parser，复用会导致 bind 到其它节点的 IP，
-    // 报 "Cannot assign requested address"(EADDRNOTAVAIL)，本节点永远无法成为 leader。
+    // 必须按本 listener 自己的 ip:port 解析地址：HA 主备场景下同一端口会先后出现不同 IP 的 parser，
+    // 若按端口复用会 bind 到其它节点的 IP，报 "Cannot assign requested address"(EADDRNOTAVAIL)，
+    // 本节点永远无法成为 leader。parser 管理器按完整 url（ip+port）缓存，不会出现该问题。
     auto &mgr = mf::SocketAddressParserMgr::getInstance();
     auto parser = mgr.CreateParser(BuildListenUrl(listenIp_, listenPort_));
     VALIDATE_RETURN(parser != nullptr, "parser not initialized", ACC_ERROR);

@@ -449,7 +449,7 @@ TEST_F(HybmMemSegmentTest, HybmDevLegacySegment_Import_WhenShareDisabled)
     std::vector<std::string> allExInfo{encoded};
 
     void *addresses[1]{};
-    auto ret = seg.Import(allExInfo, addresses);
+    auto ret = seg.Import(allExInfo, addresses, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_OK);
     // imports_ 应该包含一条记录；必须先确认非空，否则失败时下标访问会 SEGV 掉整个测试进程
     ASSERT_EQ(seg.imports_.size(), 1U) << "Import ret=" << ret;
@@ -649,7 +649,7 @@ TEST_F(HybmMemSegmentTest, ConnBasedSegment_Import_AddsRemoteVaInfo)
     std::vector<std::string> allExInfo{encoded};
 
     void *addresses[1]{};
-    auto ret = seg.Import(allExInfo, addresses);
+    auto ret = seg.Import(allExInfo, addresses, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_OK);
     // imports_ 应该包含一条记录；必须先确认非空，否则失败时下标访问会 SEGV 掉整个测试进程
     ASSERT_EQ(seg.imports_.size(), 1U) << "Import ret=" << ret;
@@ -1025,7 +1025,7 @@ TEST_F(HybmMemSegmentTest, VmmBasedSegment_Import_WhenShareDisabled)
     ock::mf::HybmVmmBasedSegment seg(opt, 0);
     std::vector<std::string> allExInfo = {"dummy-info"};
     void *addresses[1]{};
-    auto ret = seg.Import(allExInfo, addresses);
+    auto ret = seg.Import(allExInfo, addresses, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_INVALID_PARAM);
     ret = seg.Mmap();
     EXPECT_EQ(ret, BM_OK);

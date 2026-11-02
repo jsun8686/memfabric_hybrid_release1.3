@@ -20,7 +20,6 @@ namespace mf {
 
 using hybmCopyExtendFunc = void (*)(void *, void *, uint64_t, uint32_t, void *);
 using hybmBatchCopyExtendFunc = void (*)(void *, uint32_t, void *, uint32_t, void *);
-using hybmBatchCopyQuantFunc = void (*)(void *, uint32_t, uint32_t, uint32_t, void *, uint32_t, void *);
 
 class DlHybmExtendApi {
 public:
@@ -49,18 +48,6 @@ public:
         return BM_OK;
     }
 
-    static inline Result HybmBatchCopyQuant(void *param, uint32_t count, uint32_t unit, uint32_t flags, void *mask,
-                                            uint32_t concurrent, void *stream)
-    {
-        if (pHybmBatchCopyQuant == nullptr) {
-            return BM_UNDER_API_UNLOAD;
-        }
-        TP_TRACE_BEGIN(TP_HYBM_EXTEND_BATCH_COPY_QUANT);
-        pHybmBatchCopyQuant(param, count, unit, flags, mask, concurrent, stream);
-        TP_TRACE_END(TP_HYBM_EXTEND_BATCH_COPY_QUANT, BM_OK);
-        return BM_OK;
-    }
-
 private:
     static std::mutex gMutex;
     static bool gLoaded;
@@ -69,7 +56,6 @@ private:
 
     static hybmCopyExtendFunc pHybmCopyExtend;
     static hybmBatchCopyExtendFunc pHybmBatchCopyExtend;
-    static hybmBatchCopyQuantFunc pHybmBatchCopyQuant;
 };
 } // namespace mf
 } // namespace ock

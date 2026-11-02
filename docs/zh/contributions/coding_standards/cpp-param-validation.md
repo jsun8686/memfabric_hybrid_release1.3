@@ -19,7 +19,7 @@
 | Device kernel 入口 | `extern "C"` + kernel 函数名 | `OffloadOpsEntryGather(...)`、`smem_bm_copy_batch(...)` |
 | 公开 C API | `extern "C"` 或 `include/` 下头文件声明 | `smem_bm_init(...)`、`hybm_create_entity(...)` |
 | Python 绑定 | `pybind11` module def | `m.def("batch_write", ...)` |
-| 跨进程回调 | RPC/消息处理函数 | `smem_trans_set_peer_down_callback(...)` |
+| 跨进程回调 | RPC/消息处理函数 | `smem_acc_server_set_request_handler(...)` |
 
 ## 校验检查清单
 
@@ -92,10 +92,10 @@ int32_t smem_trans_batch_write(smem_trans_t handle, const void *localAddrs[], co
 ## 错误示例
 
 ```cpp
-// 错误：storeURL 未判空，std::string 构造函数内部调用 strlen 解引用 nullptr
-smem_trans_t smem_trans_create(const char *storeUrl, const char *uniqueId, const smem_trans_config_t *config) {
-  smem_trans_config_t localConfig = *config;  // config 也未判空！
-  auto trans = std::make_unique<SmTransEntry>(storeUrl, uniqueId, localConfig);  // storeUrl 为 nullptr 时崩溃
+// 错误：config 未判空即解引用，config->url 未判空即交给 std::string 构造（内部调用 strlen）
+smem_trans_t smem_trans_create(const smem_trans_config_t *config, uint32_t flags) {
+  std::string url = config->url;  // config 为 nullptr 时崩溃；url 为空串时后续建链失败
+  auto trans = std::make_unique<SmTransEntry>(*config);  // config 未判空直接被解引用
   ...
 }
 ```

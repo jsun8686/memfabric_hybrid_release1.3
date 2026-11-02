@@ -172,16 +172,16 @@ Result HybmVaManager::AddVaInfo(const BaseAllocatedGvaInfo &baseInfo, bool onlyG
     return BM_OK;
 }
 
-void HybmVaManager::RemoveOneVaInfo(uint64_t va, uint32_t type)
+bool HybmVaManager::RemoveOneVaInfo(uint64_t va, uint32_t type)
 {
     if (va == 0 || type >= HVM_BUTT) {
-        return;
+        return false;
     }
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto it = allocatedMap_[type].find(va);
     if (it == allocatedMap_[type].end()) {
         BM_LOG_WARN("Unable to RemoveOneVaInfo: address not found. va=" << VaToStr(va) << " type=" << type);
-        return;
+        return false;
     }
     const AllocatedGvaInfo record = it->second;
     BM_LOG_INFO("Removing VaInfo: " << record);
@@ -192,19 +192,27 @@ void HybmVaManager::RemoveOneVaInfo(uint64_t va, uint32_t type)
         BM_LOG_WARN("RemoveOneVaInfo cascades on a shared GVA row, dva=" << VaToStr(record.base.va[HVM_DVA])
                                                                          << " may belong to a coexisting record");
     }
+    bool allFreed = true;
     for (uint32_t i = 0; i < HVM_BUTT; i++) {
-        RemoveRowRef(i, record.base.va[i]);
+        if (record.base.va[i] == 0) {
+            continue;
+        }
+        if (!RemoveRowRef(i, record.base.va[i])) {
+            allFreed = false;
+        }
     }
-    BM_LOG_DEBUG("RemoveOneGvaInfo success: gva=" << VaToStr(va) << " type=" << type);
+    BM_LOG_DEBUG("RemoveOneGvaInfo success: gva=" << VaToStr(va) << " type=" << type << " allFreed=" << allFreed);
+    return allFreed;
 }
 
-void HybmVaManager::RemoveOneVaInfo(uint64_t gva, uint64_t dva, uint64_t hva)
+bool HybmVaManager::RemoveOneVaInfo(uint64_t gva, uint64_t dva, uint64_t hva)
 {
     if (gva == 0 && dva == 0 && hva == 0) {
         BM_LOG_WARN("RemoveOneVaInfo: all keys are zero, nothing to remove");
-        return;
+        return false;
     }
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    bool allFreed = true;
     bool removedAny = false;
     uint64_t keys[HVM_BUTT] = {};
     keys[HVM_GVA] = gva;
@@ -215,12 +223,16 @@ void HybmVaManager::RemoveOneVaInfo(uint64_t gva, uint64_t dva, uint64_t hva)
             continue;
         }
         removedAny = true;
-        RemoveRowRef(i, keys[i]);
+        if (!RemoveRowRef(i, keys[i])) {
+            allFreed = false;
+        }
     }
     if (!removedAny) {
         BM_LOG_WARN("RemoveOneVaInfo: none of the keys has a live row, gva=" << VaToStr(gva) << " dva=" << VaToStr(dva)
                                                                              << " hva=" << VaToStr(hva));
+        return false;
     }
+    return allFreed;
 }
 
 void HybmVaManager::AddRowRef(uint32_t type, uint64_t key)
@@ -236,19 +248,21 @@ void HybmVaManager::AddRowRef(uint32_t type, uint64_t key)
     }
 }
 
-void HybmVaManager::RemoveRowRef(uint32_t type, uint64_t key)
+bool HybmVaManager::RemoveRowRef(uint32_t type, uint64_t key)
 {
     if (key == 0 || type >= HVM_BUTT) {
-        return;
+        return false;
     }
     auto cntIt = rowRefCnt_[type].find(key);
     if (cntIt == rowRefCnt_[type].end()) {
-        return;
+        return false;
     }
     if (--cntIt->second == 0) {
         rowRefCnt_[type].erase(cntIt);
         allocatedMap_[type].erase(key);
+        return true;
     }
+    return false;
 }
 
 uint64_t HybmVaManager::TransformVa(uint64_t va, uint32_t inputType, uint32_t outputType)
@@ -398,7 +412,8 @@ bool HybmVaManager::ClassifyAddressMaskLocked(uint64_t va, uint8_t &mask) const
                 mask = 0; // 未 join → 无效
                 return true;
             }
-            if (it->second.memType == HYBM_MEM_TYPE_DEVICE) {
+            if (r.memType == HYBM_MEM_TYPE_DEVICE ||
+                (r.memType == HYBM_MEM_TYPE_BUTT && it->second.memType == HYBM_MEM_TYPE_DEVICE)) {
                 mask = BIT_LOCAL_DEVICE | BIT_GLOBAL_DEVICE;
             } else {
                 mask = BIT_LOCAL_HOST | BIT_GLOBAL_HOST;
@@ -499,8 +514,6 @@ ReservedGvaInfo HybmVaManager::AllocReserveGva(const GvaReserveOptions &options)
     BM_VALIDATE_RETURN(options.size != 0, "size must > 0.", result);
     BM_VALIDATE_RETURN(options.localSize != 0 || options.enable56BitsGva,
                        "local size must > 0 when 56-bit GVA is not enabled.", result);
-    BM_VALIDATE_RETURN(options.expectAddr == 0 || options.enable56BitsGva,
-                       "expect addr only applies to the 56-bit GVA area.", result);
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     uint64_t lva = 0;
@@ -531,17 +544,6 @@ ReservedGvaInfo HybmVaManager::AllocReserveGva(const GvaReserveOptions &options)
         }
 
         BM_LOG_DEBUG("enable56BitsGva searching in GVA range " << VaToStr(startAddr) << "-" << VaToStr(endAddr));
-        if (options.expectAddr != 0) {
-            // Caller-dictated layout (one GVA window per entity): narrowing the search to that single slot makes
-            // first fit resolve to the requested address, and FindFreeSpace reports it as taken if it is.
-            if (options.expectAddr < startAddr || options.expectAddr > endAddr - options.size) {
-                BM_LOG_ERROR("AllocReserveGva failed: expect addr " << VaToStr(options.expectAddr)
-                                                                    << " outside the area");
-                return result;
-            }
-            startAddr = options.expectAddr;
-            endAddr = options.expectAddr + options.size;
-        }
         // Find free space
         auto [freeAddr, found] = FindFreeSpace(startAddr, endAddr, options.size, HVM_GVA);
         if (!found) {

@@ -29,6 +29,7 @@
   - [3. 注册/批量注册/注销内存](#3-注册批量注册注销内存)
   - [4. 同步读/写](#4-同步读写)
   - [5. 异步读/写提交](#5-异步读写提交)
+  - [6. 异步批量拷贝](#6-异步批量拷贝)
 - [ACC OFFLOAD接口列表](#acc-offload接口列表)
 - [环境变量](#环境变量)
 
@@ -790,17 +791,31 @@ int32_t smem_trans_config_init(smem_trans_config_t *config);
 |config|初始化参数|
 |返回值|成功返回0，其他为错误码|
 
+**smem_trans_config_t 结构体参数说明**：
+
+|成员|含义|
+|-|-|
+|role|TRANS角色，取值参考smem_trans_role_t（`SMEM_TRANS_SENDER`/`SMEM_TRANS_RECEIVER`/`SMEM_TRANS_BOTH`），默认`SMEM_TRANS_SENDER`|
+|initTimeout|初始化/建链等待超时时间，单位秒，默认120秒|
+|deviceId|绑定的NPU设备ID|
+|flags|预留参数|
+|dataOpType|数据操作类型，取值参考smem_bm_data_op_type定义|
+|nic|host_rdma场景使用的网卡地址，格式`tcp://ip:port`|
+|url|本TRANS实例的唯一标识，格式`ip:port`，**必填**；端口填`0`表示按`MF_CONFIG_STORE_PORT_START`/`MF_CONFIG_STORE_PORT_END`自动选择可用端口，可通过`smem_trans_get_rpc_port`获取实际端口|
+|hcomTlsConfig|host_rdma场景的hcom TLS配置|
+
 #### smem_trans_init
 
-TRANS初始化。
+TRANS初始化，所有进程在创建TRANS实例前必须调用。
 
 ```c
-int32_t smem_trans_init(const smem_trans_config_t *config);
+int32_t smem_trans_init(uint32_t deviceId, uint32_t flags);
 ```
 
 |参数/返回值|含义|
 |-|-|
-|config|TRANS初始化配置|
+|deviceId|NPU设备ID|
+|flags|预留参数|
 |返回值|成功返回0，失败返回错误码|
 
 #### smem_trans_uninit
@@ -819,17 +834,16 @@ void smem_trans_uninit(uint32_t flags);
 
 #### smem_trans_create
 
-创建TRANS实例。
+创建TRANS实例。实例内部会按`config->url`创建自己的config store服务端（无需调用方提前创建config store），并在首次拷贝时按需与对端建立连接。
 
 ```c
-smem_trans_t smem_trans_create(const char *storeUrl, const char *uniqueId, const smem_trans_config_t *config);
+smem_trans_t smem_trans_create(const smem_trans_config_t *config, uint32_t flags);
 ```
 
 |参数/返回值|含义|
 |-|--|
-|storeURL|config store地址，格式支持 `tcp://ip:port`、`etcd://ip:port`、`etcd://ip:port#instanceId`（etcd 多集群隔离）|
-|uniqueId|该TRANS实例的唯一标识，格式ip:port|
-|config|TRANS初始化配置|
+|config|TRANS初始化配置，其中`config->url`为必填的本实例唯一标识|
+|flags|预留参数|
 |返回值|成功返回 TRANS 实例句柄，失败返回 NULL|
 
 #### smem_trans_destroy
@@ -844,6 +858,20 @@ void smem_trans_destroy(smem_trans_t handle, uint32_t flags);
 |-|--|
 |handle|TRANS对象handle|
 |flags|预留参数|
+
+#### smem_trans_get_rpc_port
+
+获取TRANS实例内部config store服务的实际侦听端口。当`smem_trans_config_t.url`的端口填`0`（自动选择）时，用本接口取回真实端口并据此拼接对端可访问的url。
+
+```c
+int32_t smem_trans_get_rpc_port(smem_trans_t handle, uint16_t *port);
+```
+
+|参数/返回值|含义|
+|-|-|
+|handle|TRANS对象handle|
+|port|出参，返回实际侦听的端口号|
+|返回值|成功返回0，其他为错误码|
 
 ### 3. 注册/批量注册/注销内存
 
@@ -1015,6 +1043,59 @@ int32_t smem_trans_write_submit(smem_trans_t handle, const void *localAddr, cons
 | dataSize     | 传输数据大小               |
 | stream       | 需要将任务提交到的aclrtStream |
 | 返回值          | 成功返回0，其他为错误码         |
+
+### 6. 异步批量拷贝
+
+#### smem_trans_batch_copy
+
+提交异步批量拷贝任务。任务入队后由内部后台线程执行（线程数由环境变量`MF_TRANS_THREAD_NUM`控制），返回唯一`batchId`用于查询状态；`param->destUrl`对应的对端连接在首次拷贝时按需建立。
+
+```c
+int32_t smem_trans_batch_copy(smem_trans_t handle, smem_trans_batch_params_t *param, uint64_t *batchId);
+```
+
+|参数/返回值|含义|
+|-|-|
+|handle|TRANS对象handle|
+|param|批量拷贝参数，参考smem_trans_batch_params_t定义|
+|batchId|出参，本次任务的唯一标识|
+|返回值|成功返回0，其他为错误码|
+
+**smem_trans_batch_params_t 结构体参数说明**：
+
+|成员|含义|
+|-|-|
+|destUrl|对端TRANS实例的唯一标识，格式`ip:port`|
+|srcList|写（`SMEM_TRANS_OP_WRITE`）时为本地源地址列表；读（`SMEM_TRANS_OP_READ`）时为本地接收地址列表|
+|destList|写时为远端目的地址列表；读时为远端源地址列表|
+|sizeList|每个拷贝任务的字节数列表|
+|batchSize|拷贝任务数量，必须大于0|
+|opcode|拷贝方向，取值参考smem_trans_opcode_t|
+|stream|需要将任务提交到的aclrtStream，可为空|
+|flags|预留参数|
+
+**smem_trans_opcode_t 枚举说明**：
+
+|枚举值|含义|
+|-|-|
+|SMEM_TRANS_OP_READ|从对端读取数据到本地|
+|SMEM_TRANS_OP_WRITE|将本地数据写入对端|
+
+#### smem_trans_batch_status_query
+
+查询`smem_trans_batch_copy`提交的任务状态。任务完成后本接口会把该任务从内部状态表中移除，即同一个`batchId`只应查询到一次完成结果。
+
+```c
+int32_t smem_trans_batch_status_query(smem_trans_t handle, uint64_t batchId, int32_t *result, uint32_t flags);
+```
+
+|参数/返回值|含义|
+|-|-|
+|handle|TRANS对象handle|
+|batchId|smem_trans_batch_copy返回的任务标识|
+|result|出参，任务完成时写入拷贝结果（0为成功，其他为错误码）|
+|flags|预留参数|
+|返回值|任务已完成返回0；任务仍在执行返回`-2015`（SM_NEED_RETRY）；`batchId`不存在或其他错误返回负错误码|
 
 > [!CAUTION] 注意
 > 如下接口对外封装了相同含义的Python接口，详细信息可参考`src/acc_offload/csrc/python_wrapper/pymf_acc_offload.cpp`。

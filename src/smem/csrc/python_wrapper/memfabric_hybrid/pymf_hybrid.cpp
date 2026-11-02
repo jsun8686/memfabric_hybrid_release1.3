@@ -569,9 +569,12 @@ void DefineShmClass(py::module_ &m)
             "set_context",
             [](ShareMemory &shm, py::bytes data) {
                 auto str = py::bytes(data).cast<std::string>();
+                // release the GIL only around the blocking smem call: both the py::bytes
+                // conversion above and the interpreter state must keep the GIL held
+                py::gil_scoped_release release;
                 shm.SetExternContext(str.data(), str.size());
             },
-            py::call_guard<py::gil_scoped_release>(), py::arg("context"), R"(
+            py::arg("context"), R"(
 Set user extra context of shm object.
 
 Arguments:
@@ -598,10 +601,15 @@ Do barrier on a shm object, using control network.)")
                 auto outputSize = str.size() * shm.RankSize();
                 std::string output;
                 output.resize(outputSize);
-                shm.AllGather(str.c_str(), str.size(), const_cast<char *>(output.data()), outputSize);
+                {
+                    // the GIL must be released only around the blocking smem call; building the
+                    // returned py::bytes below needs the GIL held again
+                    py::gil_scoped_release release;
+                    shm.AllGather(str.c_str(), str.size(), const_cast<char *>(output.data()), outputSize);
+                }
                 return py::bytes(output.c_str(), outputSize);
             },
-            py::call_guard<py::gil_scoped_release>(), py::arg("local_data"), R"(
+            py::arg("local_data"), R"(
 Do all gather on a shm object, using control network
 
 Arguments:

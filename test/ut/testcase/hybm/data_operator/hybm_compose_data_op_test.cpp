@@ -1002,24 +1002,6 @@ TEST_F(HybmComposeDataOpTest, initialize_with_host_shm_failed)
     ASSERT_EQ(1UL, hostShmDataOpMock->initializeCount);
 }
 
-TEST_F(HybmComposeDataOpTest, quant_copy_no_sdma)
-{
-    hybm_options options{};
-    options.bmType = HYBM_TYPE_HOST_INITIATE;
-    options.bmDataOpType = HYBM_DOP_TYPE_HOST_RDMA;
-    auto tag = std::make_shared<ock::mf::HybmEntityTagInfo>();
-    tag->TagInfoInit(options);
-
-    MOCKER(ock::mf::DataOperatorFactory::CreateHostRdmaDataOperator).stubs().will(invoke(CreateHostRdmaDataOperator));
-
-    ock::mf::HostComposeDataOp dataOp(options, nullptr, tag);
-    ASSERT_EQ(BM_OK, dataOp.Initialize());
-
-    hybm_quant_copy_params params{};
-    auto ret = dataOp.QuantCopy(params);
-    ASSERT_NE(BM_OK, ret);
-}
-
 TEST_F(HybmComposeDataOpTest, data_copy_no_operator_available)
 {
     hybm_options options{};
@@ -1103,22 +1085,4 @@ TEST_F(HybmComposeDataOpTest, initialize_hcomm_device_then_uninit)
 
     dataOp.UnInitialize();
     ASSERT_EQ(1UL, devRdmaDataOpMock->uninitializeCount);
-}
-
-// QuantCopy 无 SDMA 且已初始化 → 返回错误
-TEST_F(HybmComposeDataOpTest, quant_copy_init_no_sdma)
-{
-    hybm_options options{};
-    options.bmType = HYBM_TYPE_HOST_INITIATE;
-    options.bmDataOpType = HYBM_DOP_TYPE_HOST_RDMA;
-    auto tag = std::make_shared<ock::mf::HybmEntityTagInfo>();
-    tag->TagInfoInit(options);
-
-    MOCKER(ock::mf::DataOperatorFactory::CreateHostRdmaDataOperator).stubs().will(invoke(CreateHostRdmaDataOperator));
-
-    ock::mf::HostComposeDataOp dataOp(options, nullptr, tag);
-    ASSERT_EQ(BM_OK, dataOp.Initialize());
-
-    hybm_quant_copy_params params{};
-    ASSERT_NE(BM_OK, dataOp.QuantCopy(params));
 }

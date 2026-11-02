@@ -76,14 +76,13 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration)
 
 static inline void init_warmup_data(char *&warmup_data, size_t length)
 {
-    const size_t STEP_SIZE = 4;
-    uint64_t *p;
+    /* every step writes one uint64_t, so the step must be sizeof(uint64_t) to stay inside the buffer */
+    const size_t STEP_SIZE = sizeof(uint64_t);
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<uint64_t> dis(0, MAX_UINT32);
-    p = reinterpret_cast<uint64_t *>(warmup_data);
-    for (uint64_t i = 0; i < length; i += STEP_SIZE) {
-        p = reinterpret_cast<uint64_t *>(&warmup_data[i]);
+    for (uint64_t i = 0; i + STEP_SIZE <= length; i += STEP_SIZE) {
+        auto *p = reinterpret_cast<uint64_t *>(&warmup_data[i]);
         *p = static_cast<uint64_t>(dis(gen));
     }
 }
@@ -110,10 +109,11 @@ int32_t trans_perf_test(smem_trans_t trans_handle, smem_shm_t shm_handle, int ra
     ret = smem_shm_control_barrier(shm_handle);
     CHECK_GOTO_ERR(ret, "barrier failed, ret:" << ret << " rank:" << rank_id, out);
 
-    if (rank_id == 1) {
-        ret = smem_trans_register_mem(trans_handle, dev_addr, GVA_SIZE, 0);
-        CHECK_GOTO_ERR(ret, "failed to register device memory, ret:" << ret, out);
-    }
+    /* both ranks must register their buffer: the sender reads its local source through the
+     * registered window (device_rdma and sdma can not copy an unregistered local address) and the
+     * receiver exposes its buffer as the remote write target */
+    ret = smem_trans_register_mem(trans_handle, dev_addr, GVA_SIZE, 0);
+    CHECK_GOTO_ERR(ret, "failed to register device memory, ret:" << ret << " rank:" << rank_id, out);
     ret = smem_shm_control_barrier(shm_handle);
     std::this_thread::sleep_for(std::chrono::seconds(10UL)); // wait for register
     CHECK_GOTO_ERR(ret, "barrier failed, ret:" << ret << " rank:" << rank_id, out);
@@ -258,25 +258,28 @@ int32_t trans_test(int rank_id, int rank_size, int device_id, int use_sdma, std:
     void *shm_gva = nullptr;
     smem_trans_config_t config;
     smem_shm_config_t config2;
-    smem_trans_t trans_handle;
-    smem_shm_t shm_handle;
+    smem_trans_t trans_handle = nullptr;
+    smem_shm_t shm_handle = nullptr;
     std::string sessionId;
-    int32_t ret;
+    bool trans_inited = false;
+    bool shm_inited = false;
+    int32_t ret = 0;
 
     if (rank_id == 0) {
         ret = smem_create_config_store(ip_port.c_str(), SMEM_STORE_SKIP_RECOVER);
-        CHECK_GOTO_ERR(ret, "smem create config store failed, ret:" << " rank:" << rank_id, err1);
+        CHECK_GOTO_ERR(ret, "smem create config store failed, ret:" << ret << " rank:" << rank_id, out);
     }
 
     std::cout << std::endl << std::endl;
 
-    smem_trans_config_init(&config);
+    ret = smem_trans_config_init(&config);
+    CHECK_GOTO_ERR(ret, "smem trans config init failed, ret:" << ret << " rank:" << rank_id, out);
     if (rank_id == 0) {
-        /* Prefill */
+        /* Prefill: the transfer instance unique id is also the address of its inner config store server */
         config.role = SMEM_TRANS_SENDER;
         sessionId = "127.0.0.1:10000";
     } else {
-        /* Decode */
+        /* Decode: the peer writes to this unique id */
         config.role = SMEM_TRANS_RECEIVER;
         sessionId = "127.0.0.1:10001";
     }
@@ -286,39 +289,66 @@ int32_t trans_test(int rank_id, int rank_size, int device_id, int use_sdma, std:
     } else {
         config.dataOpType = SMEMB_DATA_OP_DEVICE_RDMA;
     }
+    (void)snprintf(config.url, sizeof(config.url), "%s", sessionId.c_str());
 
-    ret = smem_trans_init(&config);
-    if (ret != 0) {
-        std::cout << "[Failed to init smem_trans, ret=" << ret << "]" << std::endl;
-        return ret;
+    ret = smem_trans_init(device_id, 0);
+    CHECK_GOTO_ERR(ret, "smem trans init failed, ret:" << ret << " deviceId:" << device_id, out);
+    trans_inited = true;
+
+    trans_handle = smem_trans_create(&config, 0);
+    if (trans_handle == nullptr) {
+        ret = -1;
+        LOG_ERROR("smem trans create failed, url:" << sessionId << " deviceId:" << device_id);
+        goto out;
     }
-    trans_handle = smem_trans_create(ip_port.c_str(), sessionId.c_str(), &config);
-    CHECK_GOTO_ERR(!trans_handle, "smem trans create failed, ret:" << " rank:" << rank_id, err1);
-    std::cout << "[" << rank_id << "]" << " smem trans create done" << std::endl;
+    std::cout << "[" << rank_id << "]" << " smem trans create done, url:" << sessionId << std::endl;
 
     (void)smem_shm_config_init(&config2);
     config2.startConfigStoreServer = false;
 
     ret = smem_shm_init(ip_port.c_str(), rank_size, rank_id, device_id, &config2);
-    CHECK_GOTO_ERR(ret, "smem shmem init failed, ret:" << ret << " rank:" << rank_id, err2);
+    CHECK_GOTO_ERR(ret, "smem shmem init failed, ret:" << ret << " rank:" << rank_id, out);
+    shm_inited = true;
 
     shm_handle = smem_shm_create(0, rank_size, rank_id, GVA_SIZE, SMEMS_DATA_OP_MTE, 0, &shm_gva);
-    CHECK_GOTO_ERR((shm_handle == nullptr), "smem_shm_create failed, rank:" << rank_id, err3);
+    if (shm_handle == nullptr) {
+        ret = -1;
+        LOG_ERROR("smem_shm_create failed, rank:" << rank_id << " size:" << GVA_SIZE);
+        goto out;
+    }
     std::cout << "[" << rank_id << "]" << " smem shmem create done" << std::endl;
 
     ret = smem_shm_control_barrier(shm_handle);
-    CHECK_GOTO_ERR(ret, "barrier failed, ret:" << ret << " rank:" << rank_id, err4);
-    trans_perf_test(trans_handle, shm_handle, rank_id, TRANS_PERF_CONCURRENCY);
+    CHECK_GOTO_ERR(ret, "barrier failed, ret:" << ret << " rank:" << rank_id, out);
 
-err4:
-    smem_shm_destroy(shm_handle, 0);
-err3:
-    smem_shm_uninit(0);
-err2:
-    smem_trans_destroy(trans_handle, 0);
-    smem_trans_uninit(0);
-err1:
-    return 0;
+    ret = trans_perf_test(trans_handle, shm_handle, rank_id, TRANS_PERF_CONCURRENCY);
+    CHECK_GOTO_ERR(ret, "trans perf test failed, ret:" << ret << " rank:" << rank_id, out);
+
+    /* only the sender connects to the receiver, so it must leave the receiver's trans store before
+     * the receiver tears that store down; the barrier below orders the leave before the receiver
+     * reaches its own trans teardown */
+    if (rank_id == 0 && trans_handle != nullptr) {
+        smem_trans_destroy(trans_handle, 0);
+        trans_handle = nullptr;
+    }
+    (void)smem_shm_control_barrier(shm_handle);
+
+out:
+    /* keep the shm -> trans destroy order: with the reverse order the device_rdma transport
+     * teardown crashes, since both objects share the same hybm core */
+    if (shm_handle != nullptr) {
+        smem_shm_destroy(shm_handle, 0);
+    }
+    if (shm_inited) {
+        smem_shm_uninit(0);
+    }
+    if (trans_handle != nullptr) {
+        smem_trans_destroy(trans_handle, 0);
+    }
+    if (trans_inited) {
+        smem_trans_uninit(0);
+    }
+    return ret;
 }
 
 /*
@@ -328,6 +358,11 @@ err1:
 
 int32_t main(int32_t argc, char *argv[])
 {
+    const int32_t ARG_COUNT = 6;
+    if (argc < ARG_COUNT) {
+        std::cout << "usage: transfer_perf {rank_size} {rank_id} {deviceId} {useSdma} tcp://{ip}:{port}" << std::endl;
+        return -1;
+    }
     int rank_size = atoi(argv[1]);
     int rank_id = atoi(argv[2]);
     int device_id = atoi(argv[3]);
@@ -351,11 +386,12 @@ int32_t main(int32_t argc, char *argv[])
     auto ret = smem_init(0);
     CHECK_GOTO_ERR(ret, "smem init failed, ret:" << ret << " rank:" << rank_id, err1);
 
-    (void)trans_test(rank_id, rank_size, device_id, use_sdma, ipPort);
+    ret = trans_test(rank_id, rank_size, device_id, use_sdma, ipPort);
+    CHECK_GOTO_ERR(ret, "trans test failed, ret:" << ret << " rank:" << rank_id, err1);
 
     smem_uninit();
 err1:
     CHECK_ACL(aclrtResetDevice(device_id));
     CHECK_ACL(aclFinalize());
-    return 0;
+    return ret;
 }

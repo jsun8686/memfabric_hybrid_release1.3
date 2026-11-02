@@ -176,7 +176,7 @@ TEST_F(HybmHostShmSegmentTest, Import_ReturnsInvalidParamWhenDeserializeFails)
     HybmHostShmSegment segment(MakeOptions(), 0);
     std::vector<std::string> allExInfo{"bad_format"};
 
-    EXPECT_EQ(segment.Import(allExInfo, nullptr), BM_INVALID_PARAM);
+    EXPECT_EQ(segment.Import(allExInfo, nullptr, HYBM_IMPORT_RANK_INVALID), BM_INVALID_PARAM);
 }
 
 TEST_F(HybmHostShmSegmentTest, Import_ReturnsInvalidParamWhenMagicIsInvalid)
@@ -189,7 +189,7 @@ TEST_F(HybmHostShmSegmentTest, Import_ReturnsInvalidParamWhenMagicIsInvalid)
     std::string exInfo;
     ASSERT_EQ(LiteralExInfoTranslater<ShmExportInfo>{}.Serialize(info, exInfo), BM_OK);
 
-    EXPECT_EQ(segment.Import({exInfo}, nullptr), BM_INVALID_PARAM);
+    EXPECT_EQ(segment.Import({exInfo}, nullptr, HYBM_IMPORT_RANK_INVALID), BM_INVALID_PARAM);
 }
 
 TEST_F(HybmHostShmSegmentTest, Import_KeepsAllSlicesDedupDeferredToMmap)
@@ -225,7 +225,7 @@ TEST_F(HybmHostShmSegmentTest, Import_KeepsAllSlicesDedupDeferredToMmap)
     ASSERT_EQ(LiteralExInfoTranslater<ShmExportInfo>{}.Serialize(trueDuplicate, ex3), BM_OK);
     ASSERT_EQ(LiteralExInfoTranslater<ShmExportInfo>{}.Serialize(third, ex4), BM_OK);
 
-    ASSERT_EQ(segment.Import({ex1, ex2, ex3, ex4}, nullptr), BM_OK);
+    ASSERT_EQ(segment.Import({ex1, ex2, ex3, ex4}, nullptr, HYBM_IMPORT_RANK_INVALID), BM_OK);
     ASSERT_EQ(segment.imports_.size(), 4U);
     EXPECT_EQ(segment.imports_[0].rankId, 0U);
     EXPECT_EQ(segment.imports_[0].sliceIndex, 1U);
@@ -396,7 +396,7 @@ TEST_F(HybmHostShmSegmentTest, MapImportedShm_WithRealPeerFiles)
     std::string ex2;
     ASSERT_EQ(LiteralExInfoTranslater<ShmExportInfo>{}.Serialize(info0, ex0), BM_OK);
     ASSERT_EQ(LiteralExInfoTranslater<ShmExportInfo>{}.Serialize(info2, ex2), BM_OK);
-    ASSERT_EQ(segment.Import({ex0, ex2}, nullptr), BM_OK);
+    ASSERT_EQ(segment.Import({ex0, ex2}, nullptr, HYBM_IMPORT_RANK_INVALID), BM_OK);
     ASSERT_EQ(segment.imports_.size(), 2U);
 
     // Mmap 真实映射两个 peer shm

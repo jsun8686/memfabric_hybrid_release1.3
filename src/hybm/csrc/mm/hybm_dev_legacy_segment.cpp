@@ -299,8 +299,10 @@ Result HybmDevLegacySegment::GetExportSliceSize(size_t &size) noexcept
 }
 
 // import可重入
-Result HybmDevLegacySegment::Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept
+Result HybmDevLegacySegment::Import(const std::vector<std::string> &allExInfo, void *addresses[],
+                                    uint32_t overrideRank) noexcept
 {
+    (void)overrideRank; // rank 覆盖仅 trans 场景（AsymmetricMemSegment）需要
     std::map<uint32_t, HbmExportInfo> importMap;
     LiteralExInfoTranslater<HbmExportInfo> translator;
     std::vector<HbmExportInfo> desInfos{};

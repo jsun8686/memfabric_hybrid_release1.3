@@ -41,7 +41,8 @@ HYBM_API int32_t hybm_data_copy(hybm_entity_t e, hybm_copy_params *params, hybm_
         direction = static_cast<hybm_data_copy_direction>(HybmVaManager::directionLut[except]);
         if (direction >= HYBM_DATA_COPY_DIRECTION_AUTO) {
             BM_LOG_ERROR("Failed to auto infer copy direction, src:" << std::hex << params->src
-                                                                     << ", dest:" << params->dest);
+                                                                     << ", dest:" << params->dest
+                                                                     << ", except:" << static_cast<int>(except));
             return BM_INVALID_PARAM;
         }
     } else if ((HybmVaManager::dirMask[direction] & except) != HybmVaManager::dirMask[direction]) {
@@ -86,7 +87,8 @@ static int32_t BatchCopyByAutoGroup(MemEntity *entity, const hybm_batch_copy_par
         auto dir = static_cast<hybm_data_copy_direction>(HybmVaManager::directionLut[except]);
         if (dir >= HYBM_DATA_COPY_DIRECTION_AUTO) {
             BM_LOG_ERROR("failed to auto infer copy direction, index: "
-                         << i << ", src: " << std::hex << params->sources[i] << ", dest: " << params->destinations[i]);
+                         << i << ", src: " << std::hex << params->sources[i] << ", dest: " << params->destinations[i]
+                         << ", except:" << static_cast<int>(except));
             return BM_INVALID_PARAM;
         }
         groups[dir].push_back(i);
@@ -166,29 +168,4 @@ HYBM_API int32_t hybm_data_batch_copy(hybm_entity_t e, hybm_batch_copy_params *p
     }
     TP_TRACE_END(TP_HYBM_BATCH_VALIDATE_ADDRESSES, BM_OK);
     return entity->BatchCopyData(*params, direction, stream, flags);
-}
-
-HYBM_API int32_t hybm_data_quant_copy(hybm_entity_t e, hybm_quant_copy_params *params)
-{
-    BM_ASSERT_LOG_AND_RETURN(e != nullptr, "e is nullptr", BM_INVALID_PARAM);
-    BM_ASSERT_LOG_AND_RETURN(params != nullptr, "params is nullptr", BM_INVALID_PARAM);
-    BM_ASSERT_LOG_AND_RETURN(params->sources != nullptr, "params->sources is nullptr", BM_INVALID_PARAM);
-    BM_ASSERT_LOG_AND_RETURN(params->destinations != nullptr, "params->destinations is nullptr", BM_INVALID_PARAM);
-    BM_ASSERT_LOG_AND_RETURN(params->dataSizes != nullptr, "params->dataSizes is nullptr", BM_INVALID_PARAM);
-    BM_ASSERT_LOG_AND_RETURN(params->batchSize != 0, "params->batchSize = " << params->batchSize, BM_INVALID_PARAM);
-    BM_ASSERT_LOG_AND_RETURN(params->scale != nullptr, "params->scale is nullptr", BM_INVALID_PARAM);
-    BM_ASSERT_LOG_AND_RETURN(params->offset != nullptr, "params->offset is nullptr", BM_INVALID_PARAM);
-    BM_VALIDATE_RETURN(params->unitNum <= 32U * KB, "unit is " << params->unitNum << " large than 32K",
-                       BM_INVALID_PARAM);
-
-    uint32_t unitSize = params->unitNum * 2;
-    for (uint32_t i = 0; i < params->batchSize; i++) {
-        BM_VALIDATE_RETURN(params->dataSizes[i] % unitSize == 0,
-                           "dataSize:" << params->dataSizes[i] << " is not a multiple of unitSize:" << unitSize,
-                           BM_INVALID_PARAM);
-    }
-
-    auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
-    BM_ASSERT_LOG_AND_RETURN(entity != nullptr, "entity is nullptr", BM_INVALID_PARAM);
-    return entity->QuantCopy(*params);
 }

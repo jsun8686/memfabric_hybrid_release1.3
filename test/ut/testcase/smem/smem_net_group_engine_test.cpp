@@ -139,10 +139,18 @@ TEST(SmemNetGroupEngineTest, concurrent_clients_join_leave_twice_should_succeed_
                 std::cout << "[concurrent_join_leave] rank " << rank << " failed: " << reason << std::endl;
                 failedCount.fetch_add(1, std::memory_order_relaxed);
             };
+            // 提前失败的 rank 也必须走完 4 个 barrier，否则其余 rank 会永久等待，用例变成挂死而不是失败。
+            auto arriveAllBarriers = [&]() {
+                joinRound1Barrier.ArriveAndWait();
+                leaveRound1Barrier.ArriveAndWait();
+                joinRound2Barrier.ArriveAndWait();
+                leaveRound2Barrier.ArriveAndWait();
+            };
 
             auto clientBackend = SmMakeRef<SmemLocalMemoryBackend>();
             if (clientBackend == nullptr || clientBackend->Initialize("127.0.0.1", "", "") != SUCCESS) {
                 markFail("init backend");
+                arriveAllBarriers();
                 return;
             }
 
@@ -151,6 +159,7 @@ TEST(SmemNetGroupEngineTest, concurrent_clients_join_leave_twice_should_succeed_
                                                     ConfigStoreModel::CSM_CLIENT, true, kThreadCount, rank);
             if (client == nullptr || client->Startup(tlsConfig) != SM_OK) {
                 markFail("start client");
+                arriveAllBarriers();
                 return;
             }
 
@@ -166,6 +175,7 @@ TEST(SmemNetGroupEngineTest, concurrent_clients_join_leave_twice_should_succeed_
             auto group = SmemNetGroupEngine::Create(Convert<TcpConfigStore, ConfigStore>(client), option);
             if (group == nullptr) {
                 markFail("create group");
+                arriveAllBarriers();
                 return;
             }
 

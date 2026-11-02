@@ -257,15 +257,6 @@ Result HostComposeDataOp::DataCopyAsync(hybm_copy_params &params, hybm_data_copy
     return result;
 }
 
-Result HostComposeDataOp::QuantCopy(hybm_quant_copy_params &params) noexcept
-{
-    if (sdmaDataOperator_ == nullptr) {
-        BM_LOG_ERROR("SDMA data operator not exist.");
-        return BM_ERROR;
-    }
-    return sdmaDataOperator_->QuantCopy(params);
-};
-
 Result HostComposeDataOp::Wait(int32_t waitId) noexcept
 {
     /*

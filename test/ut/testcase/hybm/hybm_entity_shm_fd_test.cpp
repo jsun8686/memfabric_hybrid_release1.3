@@ -215,7 +215,7 @@ TEST_F(HybmEntityShmFdTest, add_check_result)
             return -1;
         }
 
-        auto va = hybm_get_slice_va(e, slice);
+        auto va = hybm_get_slice_va(e, slice, 0);
         if (va == nullptr) {
             BM_LOG_ERROR("get slice va failed.");
             return -1;

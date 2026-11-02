@@ -63,7 +63,7 @@ struct UserSliceExportInfo {
     uint64_t magic{USER_MEM_SLICE_EXPORT_INFO_MAGIC};
     uint32_t segmentType{SEGMENT_TYPE_USER_DEV};
     uint32_t serverId{0};
-    uint64_t gvaOffset{0}; // offset from globalVirtualAddress_ (a constant layout origin, identical everywhere)
+    uint64_t gvaOffset{0}; // offset from globalVirtualAddress_ (this entity's reserved GVA base)
     uint64_t address{0};   // lva（HBM: 设备 VA；DRAM: host VA）
     uint64_t size{0};
     uint32_t superPodId{0};
@@ -93,7 +93,8 @@ public:
     Result Export(std::string &exInfo) noexcept override;
     Result Export(const MemSlicePtr &slice, std::string &exInfo) noexcept override;
     Result GetExportSliceSize(size_t &size) noexcept override;
-    Result Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept override;
+    Result Import(const std::vector<std::string> &allExInfo, void *addresses[],
+                  uint32_t overrideRank) noexcept override;
     Result RemoveImported(const std::vector<uint32_t> &ranks) noexcept override;
     Result Mmap() noexcept override;
     Result Unmap() noexcept override;
@@ -114,12 +115,12 @@ private:
     Result CheckHostRegisterAllowed() const noexcept;
     bool NeedHostDeviceMapping() const noexcept;
     Result ExportSlice(const RegisterSlice &regSlice, std::string &exInfo) noexcept;
-    Result ImportDeviceInfo(const std::string &info) noexcept;
-    Result ImportSliceInfo(const std::string &info, MemSlicePtr &remoteSlice) noexcept;
+    Result ImportDeviceInfo(const std::string &info, uint32_t overrideRank) noexcept;
+    Result ImportSliceInfo(const std::string &info, MemSlicePtr &remoteSlice, uint32_t overrideRank) noexcept;
     Result ImportHbmSlice(const UserSliceExportInfo &sliceInfo, MemSlicePtr &remoteSlice) noexcept;
     Result ImportDramSlice(const UserSliceExportInfo &sliceInfo, MemSlicePtr &remoteSlice) noexcept;
-    // shareName 幂等查找：已导入过（白名单重试/命令重放）时返回既有 slice，避免重复映射与重复计数
-    MemSlicePtr FindReusableImport(const std::string &shareName) noexcept;
+    // 幂等查找：已导入过（白名单重试/命令重放）时返回既有 slice，避免重复映射与重复计数
+    MemSlicePtr FindReusableImport(uint64_t expectGva) noexcept;
     Result EnsurePeerAccess(uint32_t remotePhyId) noexcept;
     void ReleaseHostMapping(uint64_t hostVa) noexcept; // HalHostUnregisterEx 封装
     void RollbackImportedSlices(const std::vector<MemSlicePtr> &slices) noexcept;
@@ -146,7 +147,7 @@ private:
     std::map<uint32_t, std::vector<MemSlicePtr>> rankToRemoteSlices_;
     std::map<uint32_t, HbmExportDeviceInfo> importedDeviceInfo_;
     std::map<std::string, UserSliceExportInfo> importedSliceInfo_;
-    std::map<std::string, drv_mem_handle_t *> vmmNameToHandle_{}; // VMM 导入的远端映射 handle（key 为 129B 定长名）
+    std::map<uint64_t, drv_mem_handle_t *> vmmLvaToHandle_{};
     std::vector<std::string> memNames_{};
     std::atomic<bool> unReserveDone_{false};
 };

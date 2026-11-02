@@ -28,7 +28,7 @@ namespace {
 class DeviceQpManagerTest final : public DeviceQpManager {
 public:
     DeviceQpManagerTest(uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet)
-        : DeviceQpManager(deviceId, rankId, rankCount, devNet, HYBM_ROLE_PEER)
+        : DeviceQpManager(deviceId, rankId, rankCount, devNet, HYBM_SCENE_DEFAULT)
     {}
 
     int SetRemoteRankInfo(const std::unordered_map<uint32_t, ConnectRankInfo> &) noexcept override

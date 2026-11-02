@@ -9,7 +9,7 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
 */
-
+#include <atomic>
 #include "smem_common_includes.h"
 #include "hybm.h"
 #include "smem_trans.h"
@@ -22,7 +22,8 @@ using namespace ock::smem;
 using namespace ock::mf;
 
 ReadWriteLock g_smemTransMutex_;
-bool g_smemTransInited = false;
+// init/uninit 线程写、各 API 读（多数在锁外），故用原子标志
+std::atomic<bool> g_smemTransInited{false};
 
 SMEM_API int32_t smem_trans_config_init(smem_trans_config_t *config)
 {
@@ -33,13 +34,13 @@ SMEM_API int32_t smem_trans_config_init(smem_trans_config_t *config)
     config->deviceId = UINT32_MAX;
     config->flags = 0;
     bzero(config->nic, sizeof(config->nic));
+    bzero(config->url, sizeof(config->url));
     bzero(&config->hcomTlsConfig, sizeof(config->hcomTlsConfig));
     return SM_OK;
 }
 
-SMEM_API int32_t smem_trans_init(const smem_trans_config_t *config)
+SMEM_API int32_t smem_trans_init(uint32_t deviceId, uint32_t flags)
 {
-    SM_VALIDATE_RETURN(config != nullptr, "invalid config, which is null", SM_INVALID_PARAM);
     WriteGuard transLock(g_smemTransMutex_);
 
     if (g_smemTransInited) {
@@ -47,9 +48,9 @@ SMEM_API int32_t smem_trans_init(const smem_trans_config_t *config)
         return SM_OK;
     }
 
-    auto ret = hybm_init(config->deviceId, config->flags);
+    auto ret = hybm_init(deviceId, flags);
     if (ret != 0) {
-        SM_LOG_ERROR("hybm core init failed: " << ret);
+        SM_LOG_ERROR("hybm core init failed: " << ret << " deviceId: " << deviceId << " flags: " << flags);
         return ret;
     }
 
@@ -58,20 +59,17 @@ SMEM_API int32_t smem_trans_init(const smem_trans_config_t *config)
     return SM_OK;
 }
 
-SMEM_API smem_trans_t smem_trans_create(const char *store_url, const char *unique_id, const smem_trans_config_t *config)
+SMEM_API smem_trans_t smem_trans_create(const smem_trans_config_t *config, uint32_t flags)
 {
     SM_VALIDATE_RETURN(g_smemTransInited, "smem trans not initialized yet", nullptr);
-    SM_VALIDATE_RETURN(store_url != nullptr, "invalid store_url, which is null", nullptr);
-    SM_VALIDATE_RETURN(unique_id != nullptr, "invalid unique_id, which is null", nullptr);
     SM_VALIDATE_RETURN(config != nullptr, "invalid config, which is null", nullptr);
-    SM_VALIDATE_RETURN(strlen(store_url) != 0, "invalid store_url, which is empty", nullptr);
-    SM_VALIDATE_RETURN(strlen(unique_id) != 0, "invalid engineId, which is empty", nullptr);
+    SM_VALIDATE_RETURN(strlen(config->url) != 0, "invalid config->url, which is empty", nullptr);
     WriteGuard transLock(g_smemTransMutex_);
 
     /* create entry */
-    auto entry = SmemTransEntry::Create(unique_id, store_url, *config);
+    auto entry = SmemTransEntry::Create(*config);
     if (entry == nullptr) {
-        SM_LOG_ERROR("create entity happen error.");
+        SM_LOG_ERROR("create entity happen error, url: " << config->url << " flags: " << flags);
         return nullptr;
     }
 
@@ -109,6 +107,16 @@ SMEM_API void smem_trans_uninit(uint32_t flags)
     SM_LOG_TRACE("smem_trans_uninit finished");
 }
 
+static int32_t GetEntryByHandle(smem_trans_t handle, SmemTransEntryPtr &entry)
+{
+    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
+    if (result != SM_OK || entry == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+        return result;
+    }
+    return SM_OK;
+}
+
 SMEM_API int32_t smem_trans_register_mem(smem_trans_t handle, void *address, size_t capacity, uint32_t flags)
 {
     SM_VALIDATE_RETURN(g_smemTransInited, "smem trans not initialized yet", SM_INVALID_PARAM);
@@ -118,16 +126,15 @@ SMEM_API int32_t smem_trans_register_mem(smem_trans_t handle, void *address, siz
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
     /* register memory to entry */
-    result = entry->RegisterLocalMemory(address, capacity, flags);
+    auto result = entry->RegisterLocalMemory(address, capacity, flags);
     if (result != SM_OK) {
-        SM_LOG_AND_SET_LAST_ERROR("register local failed, result: " << result);
+        SM_LOG_AND_SET_LAST_ERROR("register local failed, result: " << result << " address: " << address
+                                                                    << " capacity: " << capacity);
         return result;
     }
     return SM_OK;
@@ -151,21 +158,14 @@ SMEM_API int32_t smem_trans_batch_register_mem(smem_trans_t handle, void *addres
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
-    if (entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("entry is null");
-        return SM_ERROR;
-    }
-
     /* register memory to entry */
-    result = entry->RegisterLocalMemories(regMemories, flags);
+    auto result = entry->RegisterLocalMemories(regMemories, flags);
     if (result != SM_OK) {
-        SM_LOG_AND_SET_LAST_ERROR("register local failed, result: " << result);
+        SM_LOG_AND_SET_LAST_ERROR("register local failed, result: " << result << " count: " << count);
         return result;
     }
     return SM_OK;
@@ -177,7 +177,14 @@ SMEM_API int32_t smem_trans_deregister_mem(smem_trans_t handle, void *address)
     SM_VALIDATE_RETURN(handle != nullptr, "invalid handle, which is null", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(address != nullptr, "invalid address, which is null", SM_INVALID_PARAM);
 
-    return SM_OK;
+    /* get entry by ptr */
+    SmemTransEntryPtr entry;
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
+        return result;
+    }
+
+    /* only maintain the local registered-memory snapshot for later replay */
+    return entry->UnregisterLocalMemory(address);
 }
 
 SMEM_API int32_t smem_trans_write(smem_trans_t handle, const void *local_addr, const char *remote_unique_id,
@@ -189,9 +196,7 @@ SMEM_API int32_t smem_trans_write(smem_trans_t handle, const void *local_addr, c
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
@@ -208,9 +213,7 @@ SMEM_API int32_t smem_trans_batch_write(smem_trans_t handle, const void *local_a
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
@@ -227,9 +230,7 @@ SMEM_API int32_t smem_trans_read(smem_trans_t handle, void *local_addr, const ch
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
@@ -247,9 +248,7 @@ SMEM_API int32_t smem_trans_batch_read(smem_trans_t handle, void *local_addrs[],
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
@@ -267,9 +266,7 @@ SMEM_API int32_t smem_trans_write_submit(smem_trans_t handle, const void *local_
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
@@ -287,9 +284,7 @@ SMEM_API int32_t smem_trans_read_submit(smem_trans_t handle, void *local_addr, c
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
@@ -308,9 +303,7 @@ SMEM_API int32_t smem_trans_batch_write_submit(smem_trans_t handle, const void *
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
@@ -329,9 +322,7 @@ SMEM_API int32_t smem_trans_batch_read_submit(smem_trans_t handle, void *localAd
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
@@ -339,36 +330,55 @@ SMEM_API int32_t smem_trans_batch_read_submit(smem_trans_t handle, void *localAd
                                     SMEMB_COPY_G2L, stream, flags);
 }
 
-SMEM_API int32_t smem_trans_batch_quant_write(smem_trans_t handle, smem_trans_quant_copy_param_t *params)
+SMEM_API int32_t smem_trans_batch_copy(smem_trans_t handle, smem_trans_batch_params_t *param, uint64_t *batchId)
 {
     SM_VALIDATE_RETURN(g_smemTransInited, "smem trans not initialized yet", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(handle != nullptr, "invalid handle, which is null", SM_INVALID_PARAM);
-    SM_VALIDATE_RETURN(params != nullptr, "invalid params, which is null", SM_INVALID_PARAM);
-    SM_VALIDATE_RETURN(params->remoteUniqueId != nullptr, "invalid remoteUniqueId, which is null", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(param != nullptr, "invalid param, which is null", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(batchId != nullptr, "invalid batchId, which is null", SM_INVALID_PARAM);
 
     /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
-    return entry->BatchQuantTransfer(params, SMEMB_COPY_L2G);
+
+    auto ret = entry->SubmitBatchCopy(*param, *batchId);
+    if (ret != SM_OK) {
+        SM_LOG_AND_SET_LAST_ERROR("submit batch copy failed, result: "
+                                  << ret << " destUrl: " << (param->destUrl != nullptr ? param->destUrl : ""));
+        return ret;
+    }
+    return SM_OK;
 }
 
-SMEM_API int32_t smem_trans_set_peer_down_callback(smem_trans_t handle, smem_trans_peer_down_callback_t callback,
-                                                   void *userData)
+SMEM_API int32_t smem_trans_batch_status_query(smem_trans_t handle, uint64_t batchId, int32_t *result, uint32_t flags)
 {
     SM_VALIDATE_RETURN(g_smemTransInited, "smem trans not initialized yet", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(handle != nullptr, "invalid handle, which is null", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(result != nullptr, "invalid result, which is null", SM_INVALID_PARAM);
 
+    /* get entry by ptr */
     SmemTransEntryPtr entry;
-    auto result = SmemTransEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
-    if (result != SM_OK || entry == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR("get entry by handle failed, handle: " << handle << " result: " << result);
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
         return result;
     }
 
-    entry->SetPeerDownCallback(callback, userData);
+    return entry->QueryBatchStatus(batchId, result, flags);
+}
+
+SMEM_API int32_t smem_trans_get_rpc_port(smem_trans_t handle, uint16_t *port)
+{
+    SM_VALIDATE_RETURN(g_smemTransInited, "smem trans not initialized yet", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(handle != nullptr, "invalid handle, which is null", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(port != nullptr, "invalid port, which is null", SM_INVALID_PARAM);
+
+    /* get entry by ptr */
+    SmemTransEntryPtr entry;
+    if (auto result = GetEntryByHandle(handle, entry); result != SM_OK) {
+        return result;
+    }
+
+    *port = entry->RpcPort();
     return SM_OK;
 }

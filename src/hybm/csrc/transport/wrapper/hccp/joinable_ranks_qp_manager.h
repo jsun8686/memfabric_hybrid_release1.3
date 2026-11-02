@@ -41,7 +41,7 @@ private:
 class JoinableRanksQpManager : public DeviceQpManager {
 public:
     JoinableRanksQpManager(uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount,
-                           sockaddr_in devNet, hybm_role_type role) noexcept;
+                           sockaddr_in devNet, hybm_scene scene) noexcept;
     ~JoinableRanksQpManager() noexcept override;
 
     int SetRemoteRankInfo(const std::unordered_map<uint32_t, ConnectRankInfo> &ranks) noexcept override;
@@ -72,7 +72,7 @@ private:
     std::map<uint32_t, ConnectionChannel> DetachConnections(const std::set<uint32_t> &ranks) noexcept;
     void FinishRemovingRanks(const std::set<uint32_t> &ranks) noexcept;
     void DeleteWhiteList(const std::map<uint32_t, ConnectionChannel> &removedConnections) noexcept;
-    void FillHccpTag(char *output, uint32_t peerRank);
+    void FillHccpTag(char *output, uint32_t peerRank, const sockaddr_in &peerNet);
     void TrySetQos();
 
 protected:

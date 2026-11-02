@@ -229,7 +229,7 @@ TEST_F(HybmConnBasedSegmentTest, Import_StoresDeserializedHostExportInfo)
     ASSERT_EQ(LiteralExInfoTranslater<HostExportInfo>{}.Serialize(info, exInfo), BM_OK);
 
     void *addresses[1U] = {nullptr};
-    ASSERT_EQ(segment.Import({exInfo}, addresses), BM_OK);
+    ASSERT_EQ(segment.Import({exInfo}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
     ASSERT_EQ(segment.imports_.size(), 1U);
     EXPECT_EQ(segment.imports_[0].gva, info.gva);
     EXPECT_EQ(segment.imports_[0].sliceIndex, info.sliceIndex);

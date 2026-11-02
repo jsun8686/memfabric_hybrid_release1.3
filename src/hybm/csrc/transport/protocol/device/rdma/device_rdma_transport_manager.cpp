@@ -87,6 +87,7 @@ Result RdmaTransportManager::OpenDevice(const TransportOptions &options)
     rankCount_ = options.rankCount;
     qpReadyCache_.reset(new std::atomic<bool>[rankCount_]());
     role_ = options.role;
+    scene_ = options.scene;
     ret = ParseDeviceNic(options.nic, devicePort_);
     BM_ASSERT_LOG_AND_RETURN(ret == BM_OK, "parse input nic(" << options.nic << ") failed!", BM_INVALID_PARAM);
 
@@ -108,7 +109,7 @@ Result RdmaTransportManager::OpenDevice(const TransportOptions &options)
         qpManager_ = std::make_shared<FixedRanksQpManager>(userId, rankId_, rankCount_, deviceAddr);
     } else {
         qpManager_ =
-            std::make_shared<JoinableRanksQpManager>(userId, deviceId_, rankId_, rankCount_, deviceAddr, role_);
+            std::make_shared<JoinableRanksQpManager>(userId, deviceId_, rankId_, rankCount_, deviceAddr, scene_);
     }
 
     deviceChipInfo_ = std::make_shared<DeviceChipInfo>(userId);

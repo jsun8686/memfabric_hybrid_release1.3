@@ -127,9 +127,6 @@ public:
         // 模拟 DlHybmExtendApi::HybmBatchCopyExtend 方法
         MOCKER(&ock::mf::DlHybmExtendApi::HybmBatchCopyExtend).stubs().will(returnValue(0));
 
-        // 模拟 DlHybmExtendApi::HybmBatchCopyQuant 方法
-        MOCKER(&ock::mf::DlHybmExtendApi::HybmBatchCopyQuant).stubs().will(returnValue(0));
-
         // 模拟全局函数
         MOCKER(HybmGetInitDeviceId).stubs().will(returnValue(0));
         // 模拟 ock::mf 命名空间中的函数
@@ -1016,54 +1013,4 @@ TEST_F(HybmDataOpSdmaTest, batch_data_copy_extend)
 
     ret = dataOp_->BatchDataCopy(params, HYBM_LOCAL_DEVICE_TO_GLOBAL_DEVICE, options);
     ASSERT_EQ(BM_OK, ret);
-}
-
-TEST_F(HybmDataOpSdmaTest, quant_copy)
-{
-    InitMockEnv();
-    // 测试量化拷贝
-    auto ret = dataOp_->Initialize();
-    ASSERT_EQ(BM_OK, ret);
-
-    // 构造有效的参数但设置 stream 为 nullptr 来触发错误
-    hybm_quant_copy_params params{};
-    params.batchSize = 1UL;
-
-    // 分配有效内存
-    void *source = (void *)malloc(1024ULL);
-    void *dest = (void *)malloc(1024ULL);
-    uint64_t dataSize = 1024ULL;
-    void *scale = (void *)malloc(4ULL);  // 4 bytes for float
-    void *offset = (void *)malloc(4ULL); // 4 bytes for float
-
-    // 设置值
-    *reinterpret_cast<float *>(scale) = 1.0f;
-    *reinterpret_cast<float *>(offset) = 0.0f;
-
-    // 准备数组指针
-    void *sources[] = {source};
-    void *destinations[] = {dest};
-    uint64_t dataSizes[] = {dataSize};
-    void *scales[] = {scale};
-    void *offsets[] = {offset};
-
-    params.sources = sources;
-    params.destinations = destinations;
-    params.dataSizes = dataSizes;
-    params.scale = scales;
-    params.offset = offsets;
-    params.unitNum = 1UL;
-    params.inputType = 0;
-    params.stream = nullptr;
-    params.flags = 0;
-
-    ret = dataOp_->QuantCopy(params);
-    // 所有 mock 函数都返回成功，所以应该返回 BM_OK
-    ASSERT_EQ(BM_OK, ret);
-
-    // 释放内存
-    free(source);
-    free(dest);
-    free(scale);
-    free(offset);
 }

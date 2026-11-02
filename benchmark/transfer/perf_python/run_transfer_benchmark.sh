@@ -41,10 +41,10 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo "Options:"
             echo "  --store-url STRING     Config store URL (default: tcp://127.0.0.1:12050)"
-            echo "  --num-threads INT      Number of concurrent threads (default: 1)"
+            echo "  --num-threads INT      Number of concurrent threads (default: 2)"
             echo "  --data-op-type STRING  Data operation type: sdma or rdma (default: sdma)"
             echo "  --npu-id-0 INT         NPU device ID for rank 0 (default: 0)"
-            echo "  --npu-id-1 INT         NPU device ID for rank 1 (default: 0)"
+            echo "  --npu-id-1 INT         NPU device ID for rank 1 (default: 7)"
             echo "  -h, --help            Show this help message"
             exit 0
             ;;

@@ -332,13 +332,30 @@ int32_t MemEntityDefault::FreeLocalMemory(hybm_mem_slice_t slice, uint32_t flags
     return BM_OK;
 }
 
-void *MemEntityDefault::GetSliceVa(hybm_mem_slice_t slice)
+// 按 flags 取 slice 的本地虚拟地址（flags=0）或 GVA（flags=HYBM_GET_SLICE_GVA）
+static void *GetSliceAddrByFlags(const MemSlice &memSlice, uint32_t flags)
 {
+    if (flags == 0U) {
+        return reinterpret_cast<void *>(memSlice.vAddress_);
+    }
+    if (memSlice.gva_ == 0) {
+        BM_LOG_ERROR("slice gva is 0, slice index:" << memSlice.index_ << " memType:" << memSlice.memType_);
+        return nullptr;
+    }
+    return reinterpret_cast<void *>(memSlice.gva_);
+}
+
+void *MemEntityDefault::GetSliceVa(hybm_mem_slice_t slice, uint32_t flags)
+{
+    if (flags != 0U && flags != HYBM_GET_SLICE_GVA) {
+        BM_LOG_ERROR("invalid flags:" << flags << " slice:" << slice);
+        return nullptr;
+    }
     std::shared_ptr<MemSlice> memSlice;
     if (hbmSegment_ != nullptr && (memSlice = hbmSegment_->GetMemSlice(slice, true)) != nullptr) {
-        return reinterpret_cast<void *>(memSlice->vAddress_);
+        return GetSliceAddrByFlags(*memSlice, flags);
     } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
-        return reinterpret_cast<void *>(memSlice->vAddress_);
+        return GetSliceAddrByFlags(*memSlice, flags);
     }
 
     BM_LOG_ERROR("failed to get slice va, invalid slice:" << slice);
@@ -536,7 +553,8 @@ int32_t MemEntityDefault::ExportSliceExchangeInfo(hybm_mem_slice_t slice, Exchan
     return BM_OK;
 }
 
-int32_t MemEntityDefault::ImportForSegment(const ExchangeInfoReader desc[], uint32_t count, void *addresses[]) noexcept
+int32_t MemEntityDefault::ImportForSegment(const ExchangeInfoReader desc[], uint32_t count, void *addresses[],
+                                           uint32_t overrideRank) noexcept
 {
     if (desc[0].LeftBytes() == 0) {
         BM_LOG_DEBUG("no segment need import.");
@@ -570,7 +588,7 @@ int32_t MemEntityDefault::ImportForSegment(const ExchangeInfoReader desc[], uint
     if (!dramInfos.empty()) {
         std::vector<void *> dramAddrs(dramInfos.size(), nullptr);
         BM_ASSERT_LOG_AND_RETURN(dramSegment_ != nullptr, "dramSegment is nullptr", BM_ERROR);
-        auto ret = dramSegment_->Import(dramInfos, dramAddrs.data());
+        auto ret = dramSegment_->Import(dramInfos, dramAddrs.data(), overrideRank);
         if (ret != BM_OK) {
             BM_LOG_ERROR("dram segment import infos failed: " << ret);
             return ret;
@@ -585,7 +603,7 @@ int32_t MemEntityDefault::ImportForSegment(const ExchangeInfoReader desc[], uint
     if (!userSegInfos.empty()) {
         std::vector<void *> userSegAddrs(userSegInfos.size(), nullptr);
         BM_ASSERT_LOG_AND_RETURN(hbmSegment_ != nullptr, "hbmSegment is nullptr", BM_ERROR);
-        auto ret = hbmSegment_->Import(userSegInfos, userSegAddrs.data());
+        auto ret = hbmSegment_->Import(userSegInfos, userSegAddrs.data(), overrideRank);
         if (ret != BM_OK) {
             // P2P 未就绪是可重试的瞬时状态，根因已在 segment 层记 WARN，这里不重复打印
             if (ret != BM_P2P_NOT_READY) {
@@ -620,14 +638,18 @@ int32_t MemEntityDefault::ImportSliceExchangeInfo(const ExchangeInfoReader desc[
         return BM_ERROR;
     }
 
-    ret = ImportForSegment(desc, count, addresses);
+    // trans 场景 rank 覆盖：flags 中解码本地分配的覆盖 rank，0 表示不覆盖
+    const uint32_t overrideRank =
+        HYBM_IMPORT_RANK_ENABLED(flags) ? HYBM_IMPORT_RANK_DECODE(flags) : HYBM_IMPORT_RANK_INVALID;
+
+    ret = ImportForSegment(desc, count, addresses, overrideRank);
     if (ret != BM_OK) {
         return ret;
     }
 
     // transport要在segment之后import
     if (transportManager_ != nullptr && !(options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA)) {
-        ret = ImportForTransportPrecheck(desc, count, addresses);
+        ret = ImportForTransportPrecheck(desc, count, addresses, overrideRank);
         if (ret != BM_OK) {
             return ret;
         }
@@ -719,12 +741,20 @@ int32_t MemEntityDefault::ImportEntityExchangeInfo(const ExchangeInfoReader desc
     BM_ASSERT_LOG_AND_RETURN(desc != nullptr, "desc is nullptr", BM_INVALID_PARAM);
     BM_ASSERT_LOG_AND_RETURN(SetThreadAclDevice() == BM_OK, "SetThreadAclDevice failed", BM_ERROR);
 
+    // trans 场景 rank 覆盖：flags 使能时用导入方本地按对端分配的 rank 替换导出端 entity rank，
+    // 无效值（UINT32_MAX）表示不覆盖
+    const uint32_t overrideRank =
+        HYBM_IMPORT_RANK_ENABLED(flags) ? HYBM_IMPORT_RANK_DECODE(flags) : HYBM_IMPORT_RANK_INVALID;
+
     std::vector<EntityExportInfo> deserializedInfos(count);
     for (auto i = 0U; i < count; i++) {
         auto ret = ReadEntityExportInfo(desc[i], deserializedInfos[i]);
         if (ret != 0) {
             BM_LOG_ERROR("deserialize imported info(" << i << ") failed.");
             return BM_INVALID_PARAM;
+        }
+        if (overrideRank != HYBM_IMPORT_RANK_INVALID) {
+            deserializedInfos[i].rankId = overrideRank;
         }
     }
     {
@@ -751,7 +781,7 @@ int32_t MemEntityDefault::ImportEntityExchangeInfo(const ExchangeInfoReader desc
         }
     }
     if (infos.size() > 0) {
-        auto ret = hbmSegment_->Import(infos, nullptr);
+        auto ret = hbmSegment_->Import(infos, nullptr, overrideRank);
         if (ret != BM_OK) {
             BM_LOG_ERROR("failed to import segment info, ret: " << ret);
             return BM_ERROR;
@@ -985,27 +1015,6 @@ int32_t MemEntityDefault::BatchCopyData(hybm_batch_copy_params &params, hybm_dat
     return ret;
 }
 
-int32_t MemEntityDefault::QuantCopy(hybm_quant_copy_params &params) noexcept
-{
-    BM_VALIDATE_RETURN(initialized_, "the object is not initialized, please check whether Initialize is called.",
-                       BM_NOT_INITIALIZED);
-    auto ret = SetThreadAclDevice();
-    BM_ASSERT_LOG_AND_RETURN(ret == BM_OK, "ret = " << ret, BM_ERROR);
-
-    ret = BM_ERROR;
-    if (dataOperator_ == nullptr) {
-        BM_LOG_ERROR("quant data copy failed, dataOperator_ is null.");
-        return ret;
-    }
-
-    ret = dataOperator_->QuantCopy(params);
-    if (ret != BM_OK) {
-        BM_LOG_ERROR("quant data copy failed, ret: " << ret);
-        return ret;
-    }
-    return ret;
-}
-
 int32_t MemEntityDefault::Wait() noexcept
 {
     if (!initialized_) {
@@ -1140,7 +1149,7 @@ void MemEntityDefault::SetHybmDeviceInfo(HybmDeviceMeta &info)
 }
 
 int32_t MemEntityDefault::ImportForTransportPrecheck(const ExchangeInfoReader desc[], uint32_t &count,
-                                                     void *addresses[])
+                                                     void *addresses[], uint32_t overrideRank)
 {
     int ret = BM_OK;
     SliceExportTransportKey transportKey;
@@ -1156,9 +1165,12 @@ int32_t MemEntityDefault::ImportForTransportPrecheck(const ExchangeInfoReader de
             transportManager_->UpdateMemoryKey(transportKey.key, addresses[i]);
         }
 
+        // trans 场景 rank 覆盖：与 entity/segment 导入路径使用同一本地覆盖 rank，
+        // 保证 ImportForTransport 中 importedMemories_ 与 importedRanks_ 的 rank key 对齐
+        const uint32_t rankId = (overrideRank != HYBM_IMPORT_RANK_INVALID) ? overrideRank : transportKey.rankId;
         {
             std::unique_lock<std::mutex> uniqueLock{importMutex_};
-            importedMemories_[transportKey.rankId].insert(transportKey.key);
+            importedMemories_[rankId].insert(transportKey.key);
         }
         BM_LOG_DEBUG("Success to import slice rankId:" << transportKey.rankId << " addr:" << std::hex
                                                        << transportKey.address);
@@ -1358,6 +1370,7 @@ Result MemEntityDefault::InitTransManager()
     options.rankCount = options_.rankCount;
     options.protocol = options_.bmDataOpType;
     options.role = options_.role;
+    options.scene = options_.scene;
     options.initialType = options_.bmType;
     options.nic = options_.transUrl;
     options.tlsOption = options_.tlsOption;

@@ -13,14 +13,7 @@
 #define PYTRANSFER_H
 
 #include <pybind11/pybind11.h>
-#include <atomic>
-#include <condition_variable>
-#include <map>
-#include <mutex>
-#include <queue>
-#include <set>
 #include <string>
-#include <thread>
 #include <vector>
 #include "smem_bm_def.h"
 #include "smem_trans.h"
@@ -88,11 +81,6 @@ public:
                                      std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
                                      uintptr_t stream, uint32_t flags);
 
-    int BatchTransferWriteWithQuant(const char *destUniqueId, std::vector<uintptr_t> buffers,
-                                    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-                                    std::vector<uintptr_t> scale_addresses, std::vector<uintptr_t> offset_addresses,
-                                    uint32_t unit_num, uint32_t input_type, uintptr_t stream, uint32_t flags);
-
     int RegisterMemory(uintptr_t buffer_addr, size_t capacity);
 
     int UnregisterMemory(uintptr_t buffer_addr);
@@ -104,68 +92,12 @@ public:
     void UnInitialize();
 
 private:
-    // === configuration ===
-    std::string GetConfigStoreProtocol(const std::string &storeUrl);
-
-    // === store initialization ===
-    int InitStoreServer(const std::string &ip, uint16_t port);
-
-    // store-client path: no real listener; picks a port
-    int InitStoreClient(const std::string &ip, uint16_t port);
-
-    // === connection management ===
-    smem_trans_t GetOrCreateConnection(const std::string &sessionId);
-    // Connect and replay the registered memories; returns nullptr on failure (connection already destroyed)
-    smem_trans_t CreateAndReplayConnection(const std::string &sessionId, const std::string &storeUrl);
-    // Clear the pending flag and wake up the waiting threads; connMutex_ must be held
-    void FinishPendingConnection(const std::string &sessionId);
-    // Replay the registered memories; returns 0 on success / -1 on failure
-    int ReplayRegisteredMemories(smem_trans_t handle);
-
-    // === link down async cleanup ===
-    static void PeerDownCallback(const char *peerAddr, void *userData);
-    void OnLinkDownByPeerAddr(const std::string &peerAddr);
-    void StartLinkDownConsumer();
-    void StopLinkDownConsumer();
-
     // ordered teardown used by destroy()/unInitialize() and the destructor
     void Shutdown();
 
-    smem_trans_t handle_ = nullptr;   // direct handle (receiver or legacy single-store sender)
-    bool smemInited_ = false;         // true after smem_trans_init succeeded
-    std::string sessionId_;           // local session id, format "IP:PORT"
-    smem_trans_config_t config_{};    // transfer config
-    std::string configStoreProtocol_; // transfer config store protocol
-    uint16_t rpcPort_ = 0;            // real listening port (set in Initialize)
-
-    // session_id → connection
-    struct DConnection {
-        smem_trans_t handle = nullptr;
-        bool active = false;
-    };
-    std::mutex connMutex_;
-    std::condition_variable connCv_;
-    std::set<std::string> pendingConnections_;
-    std::map<std::string, DConnection> connections_;
-
-    // registered memories for replay
-    struct RegMem {
-        uintptr_t addr;
-        size_t capacity;
-    };
-    std::vector<RegMem> registeredMems_;
-    std::mutex regMemMutex_; // protects registeredMems_
-
-    // link down async cleanup
-    std::queue<std::string> linkDownQueue_;
-    std::mutex linkDownQueueMutex_;
-    std::condition_variable linkDownCv_;
-    std::thread linkDownConsumerThread_;
-    std::atomic<bool> consumerRunning_{false};
-
-    // probe socket held bound for the store-client to reserve its session port;
-    // -1 for the store-server (the config-store listener holds the port).
-    int sockfd_ = -1;
+    smem_trans_t handle_ = nullptr; // transfer handle created by smem_trans_create
+    bool smemInited_ = false;       // true after smem_trans_init succeeded
+    smem_trans_config_t config_{};  // transfer config
 };
 
 #endif // PYTRANSFER_H

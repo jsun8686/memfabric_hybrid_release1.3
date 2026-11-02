@@ -34,7 +34,7 @@ namespace device {
 class AicpuJoinableRanksQpManager : public JoinableRanksQpManager {
 public:
     AicpuJoinableRanksQpManager(uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount,
-                                sockaddr_in devNet, hybm_role_type role) noexcept;
+                                sockaddr_in devNet, hybm_scene scene) noexcept;
     ~AicpuJoinableRanksQpManager() noexcept override;
 
     int SetRemoteRankInfo(const std::unordered_map<uint32_t, ConnectRankInfo> &ranks) noexcept override;

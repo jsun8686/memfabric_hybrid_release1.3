@@ -39,13 +39,15 @@ using namespace ock::mf;
 namespace {
 constexpr uint64_t TEST_GVA_BASE = 0x400000000000ULL;   // 自造的段基址（不与 HBM 地址区间重叠）
 constexpr uint64_t TEST_HBM_ADDR = HYBM_HBM_START_ADDR; // 0x100000000000, 落在 HBM 区间内
+constexpr uint64_t TEST_RANK_WINDOW = 0x50000000000ULL;
 constexpr uint64_t TEST_HOST_ADDR = 0x00007F1234000000ULL;
 constexpr uint64_t TEST_SIZE = 4096ULL;
 constexpr uint64_t TEST_SIZE_ONE_BYTE = 1ULL;
 constexpr uint64_t TEST_TOTAL_SIZE = 1ULL << 30;
 constexpr uint64_t TEST_FAKE_DVA = 0x600012340000ULL;
 constexpr uint32_t TEST_LOGIC_DEVICE_ID = 5;
-constexpr int TEST_ENTITY_ID = 200; // G.CNS.02: 段构造的 entityId 参数具名化
+constexpr uint32_t TEST_EXPORT_RANK = 8; // 导出端 rankId（导入端据此确定 override 窗口）
+constexpr int TEST_ENTITY_ID = 200;      // G.CNS.02: 段构造的 entityId 参数具名化
 // G.EXP.15: 整型测试地址到指针的转换集中于此（memcpy 转换），避免散落的 reinterpret_cast
 inline void *TestAddr(uint64_t addr)
 {
@@ -119,6 +121,8 @@ constexpr uint64_t TEST_FAKE_VMM_HANDLE = 0x900000000001ULL;
 int g_retainCount = 0, g_exportCount = 0, g_transCount = 0, g_attrCount = 0, g_vmmReleaseCount = 0;
 int g_importCount = 0, g_reserveCount = 0, g_mapCount = 0, g_unmapCount = 0, g_ipcOpenCount = 0, g_ipcCloseCount = 0;
 int g_setAccessCount = 0;
+int g_importHandleSeq = 0;
+std::vector<uint64_t> g_releasedHandles;
 int g_retainRet = 0, g_exportRet = 0, g_transRet = 0, g_attrRet = 0, g_importRet = 0, g_mapRet = 0;
 
 drv_mem_handle_t *FakeVmmHandle(uint64_t value)
@@ -126,6 +130,13 @@ drv_mem_handle_t *FakeVmmHandle(uint64_t value)
     drv_mem_handle_t *handle = nullptr;
     std::memcpy(&handle, &value, sizeof(handle));
     return handle;
+}
+
+uint64_t FakeVmmHandleValue(drv_mem_handle_t *handle)
+{
+    uint64_t value = 0;
+    std::memcpy(&value, &handle, sizeof(value));
+    return value;
 }
 
 int HalMemRetainStub(drv_mem_handle_t **handle, void *ptr)
@@ -176,7 +187,11 @@ int HalMemShareAttrStub(uint64_t handle, enum ShareHandleAttrType type, struct S
 
 int HalMemReleaseCountStub(drv_mem_handle_t *handle)
 {
-    (void)handle;
+    uint64_t value = 0;
+    std::memcpy(&value, &handle, sizeof(value));
+    if (value != 0) {
+        g_releasedHandles.push_back(value);
+    }
     g_vmmReleaseCount++;
     return 0;
 }
@@ -187,7 +202,7 @@ int HalMemImportStub(drv_mem_handle_type type, MemShareHandle *sHandle, uint32_t
     (void)sHandle;
     (void)devid;
     g_importCount++;
-    *handle = FakeVmmHandle(TEST_FAKE_VMM_HANDLE + 1U);
+    *handle = FakeVmmHandle(TEST_FAKE_VMM_HANDLE + 1U + static_cast<uint64_t>(g_importHandleSeq++));
     return g_importRet;
 }
 
@@ -344,6 +359,8 @@ public:
         g_retainCount = g_exportCount = g_transCount = g_attrCount = g_vmmReleaseCount = 0;
         g_importCount = g_reserveCount = g_mapCount = g_unmapCount = g_ipcOpenCount = g_ipcCloseCount = 0;
         g_setAccessCount = 0;
+        g_importHandleSeq = 0;
+        g_releasedHandles.clear();
         g_retainRet = g_exportRet = g_transRet = g_attrRet = g_importRet = g_mapRet = 0;
         // 判型查询默认"不可用"（回退地址段判断）；HAL 判型用例改写 g_drvMemAttrType/g_drvMemAttrRet
         g_drvMemAttrType = 0;
@@ -427,11 +444,12 @@ TEST_F(HybmAsymmetricSegmentTest, Register_HostAddr_CreatesHostSlice)
 
 /**
  * Register_HostAddr_RejectedWithoutCapability
- *  - 纯设备侧 op（无 host 类传输、无 SDMA）：host DRAM 无数据面通道，能力校验拒绝。
+ *  - 无 host/device 连接类传输、无 SDMA 的 op（如 MTE 拷贝引擎）：host DRAM 无数据面通道，能力校验拒绝。
+ *  - 连接类 op（HOST_RDMA/HOST_TCP/DEVICE_RDMA 等）现已在 CheckHostRegisterAllowed 放行。
  */
 TEST_F(HybmAsymmetricSegmentTest, Register_HostAddr_RejectedWithoutCapability)
 {
-    auto options = MakeOptions(HYBM_DOP_TYPE_DEVICE_RDMA, ASCEND_910B);
+    auto options = MakeOptions(HYBM_DOP_TYPE_MTE, ASCEND_910B);
     AsymmetricMemSegment segment(options, TEST_ENTITY_ID);
     InitSegmentBase(segment);
 
@@ -648,7 +666,7 @@ TEST_F(HybmAsymmetricSegmentTest, Import_UserDramInfo_CreatesRemoteHostSlice)
     std::vector<std::string> infos = {info};
 
     void *addresses[1] = {nullptr};
-    auto ret = segment.Import(infos, addresses);
+    auto ret = segment.Import(infos, addresses, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_OK);
     EXPECT_EQ(addresses[0], TestAddr(TEST_GVA_BASE + 0x1000000ULL));
 
@@ -688,13 +706,72 @@ TEST_F(HybmAsymmetricSegmentTest, Import_Rollback_SkipsDramGvaAddresses)
     std::vector<std::string> infos = {dramInfo, invalidInfo};
 
     void *addresses[2] = {nullptr, nullptr};
-    auto ret = segment.Import(infos, addresses);
+    auto ret = segment.Import(infos, addresses, HYBM_IMPORT_RANK_INVALID);
     EXPECT_EQ(ret, BM_INVALID_PARAM);
     EXPECT_EQ(addresses[0], TestAddr(TEST_GVA_BASE + 0x1000000ULL)); // 成功条目仍返回 GVA
     // 回滚为完整清理：映射解除 + VA 记录/导入账本同步注销，保证后续导入重试可完整重新执行
     EXPECT_EQ(segment.rankToRemoteSlices_.count(7U), 0U);
     EXPECT_EQ(segment.importedSliceInfo_.empty(), true);
     EXPECT_EQ(HybmVaManager::GetInstance().FindAllocByVa(TEST_GVA_BASE + 0x1000000ULL, HVM_GVA).second, false);
+}
+
+/**
+ * ImportHbmSlice_ReuseDoesNotAllocate
+ *  - 幂等复用命中不分配新 slice（index_ 不递增），也不重复登记映射，避免重复 ReserveLva/map
+ *    与 va_manager 重复计数。
+ */
+TEST_F(HybmAsymmetricSegmentTest, ImportHbmSlice_ReuseDoesNotAllocate)
+{
+    auto options = MakeOptions(HYBM_DOP_TYPE_SDMA, ASCEND_950);
+    AsymmetricMemSegment segment(options, TEST_ENTITY_ID);
+    InitSegmentBase(segment);
+    MOCKER(&ock::mf::DlAclApi::RtIpcOpenMemory).stubs().will(invoke(RtIpcOpenMemoryStub));
+
+    MemSlicePtr slice1;
+    ASSERT_EQ(segment.ImportHbmSlice(MakeIpcSliceInfo(0x2000000ULL, TEST_EXPORT_RANK), slice1), BM_OK);
+    ASSERT_NE(slice1, nullptr);
+    ASSERT_EQ(segment.remoteSlices_.size(), 1U);
+    const uint32_t firstIndex = slice1->index_;
+
+    MemSlicePtr slice2;
+    ASSERT_EQ(segment.ImportHbmSlice(MakeIpcSliceInfo(0x2000000ULL, TEST_EXPORT_RANK), slice2), BM_OK);
+    EXPECT_EQ(slice1.get(), slice2.get());
+    EXPECT_EQ(slice2->index_, firstIndex);       // 复用不重新分配
+    EXPECT_EQ(segment.remoteSlices_.size(), 1U); // 也不再登记
+}
+
+/**
+ * ImportHbmSlice_ReuseScopedByGva
+ *  - 幂等短路按 gva 命中：跨窗口复用会交出旧窗口 gva，数据面按 gva 反推 rank 走错通道。
+ */
+TEST_F(HybmAsymmetricSegmentTest, ImportHbmSlice_ReuseScopedByGva)
+{
+    auto options = MakeOptions(HYBM_DOP_TYPE_SDMA, ASCEND_950);
+    AsymmetricMemSegment segment(options, TEST_ENTITY_ID);
+    InitSegmentBase(segment);
+    MOCKER(&ock::mf::DlAclApi::RtIpcOpenMemory).stubs().will(invoke(RtIpcOpenMemoryStub));
+
+    const auto sliceInfo = MakeIpcSliceInfo(0x2000000ULL, TEST_EXPORT_RANK);
+    MemSlicePtr slice1;
+    ASSERT_EQ(segment.ImportHbmSlice(sliceInfo, slice1), BM_OK);
+    ASSERT_EQ(g_ipcOpenCount, 1);
+
+    EXPECT_EQ(segment.FindReusableImport(slice1->gva_).get(), slice1.get());
+    EXPECT_EQ(segment.FindReusableImport(slice1->gva_ + TEST_RANK_WINDOW).get(), nullptr);
+
+    auto sameGvaDiffHandle = MakeIpcSliceInfo(0x2000000ULL, TEST_EXPORT_RANK);
+    sameGvaDiffHandle.name[1] = 'x';
+    MemSlicePtr sameGva;
+    ASSERT_EQ(segment.ImportHbmSlice(sameGvaDiffHandle, sameGva), BM_OK);
+    EXPECT_EQ(sameGva.get(), slice1.get());
+    EXPECT_EQ(g_ipcOpenCount, 1);
+
+    MemSlicePtr slice2;
+    ASSERT_EQ(segment.ImportHbmSlice(MakeIpcSliceInfo(0x4000000ULL, TEST_EXPORT_RANK), slice2), BM_OK);
+    EXPECT_NE(slice1.get(), slice2.get());
+    EXPECT_NE(slice2->index_, slice1->index_);
+    EXPECT_EQ(g_ipcOpenCount, 2);
+    EXPECT_EQ(segment.remoteSlices_.size(), 2U);
 }
 
 /**
@@ -766,7 +843,7 @@ TEST_F(HybmAsymmetricSegmentTest, ImportDeviceInfo_SkipsEmptyNameWhitelist)
     deviceInfo.pid = 456U;
     std::string info(reinterpret_cast<const char *>(&deviceInfo), sizeof(deviceInfo));
 
-    EXPECT_EQ(segment.ImportDeviceInfo(info), BM_OK);
+    EXPECT_EQ(segment.ImportDeviceInfo(info, HYBM_IMPORT_RANK_INVALID), BM_OK);
     EXPECT_EQ(g_ipcWhitelistCount, 1);
 }
 
@@ -802,7 +879,7 @@ TEST_F(HybmAsymmetricSegmentTest, Register_DupAddr_FakeRegister_ReuseSlice)
 
 /**
  * ImportSlice_A5_VmmMap
- *  - VMM name 导入：import/reserve/map 全链路成功；vmmNameToHandle_ 登记且 key 为 129B 定长名；
+ *  - VMM name 导入：import/reserve/map 全链路成功；vmmLvaToHandle_ 登记且 key 为本端映射 LVA；
  *  - slice vAddress_ 为预留 LVA，addresses 返回 gva。
  */
 TEST_F(HybmAsymmetricSegmentTest, ImportSlice_A5_VmmMap)
@@ -815,16 +892,16 @@ TEST_F(HybmAsymmetricSegmentTest, ImportSlice_A5_VmmMap)
     auto sliceInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addresses[1] = {nullptr};
-    EXPECT_EQ(segment.Import({data}, addresses), BM_OK);
+    EXPECT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
 
     EXPECT_EQ(g_importCount, 1);
     EXPECT_EQ(g_reserveCount, 1);
     EXPECT_EQ(g_mapCount, 1);
-    ASSERT_EQ(segment.vmmNameToHandle_.size(), 1U);
-    EXPECT_NE(segment.vmmNameToHandle_.count(std::string(sliceInfo.name, USER_HBM_NAME_MAX_LEN)), 0U);
+    ASSERT_EQ(segment.vmmLvaToHandle_.size(), 1U);
 
     auto remoteSlice = segment.rankToRemoteSlices_.at(7U).at(0);
     EXPECT_NE(remoteSlice->vAddress_, 0U);
+    EXPECT_EQ(segment.vmmLvaToHandle_.count(remoteSlice->vAddress_), 1U);
     EXPECT_EQ(addresses[0], TestAddr(TEST_GVA_BASE + 0x1000000ULL));
     EXPECT_EQ(g_setAccessCount, 1); // import 映射后本地设备 RW 授权
 }
@@ -843,7 +920,7 @@ TEST_F(HybmAsymmetricSegmentTest, ResolveRemoteGva_MappedImport_HitsOwnLva)
     auto sliceInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addresses[1] = {nullptr};
-    ASSERT_EQ(segment.Import({data}, addresses), BM_OK);
+    ASSERT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
 
     auto remoteSlice = segment.rankToRemoteSlices_.at(7U).at(0);
     const auto gva = remoteSlice->gva_;
@@ -875,8 +952,8 @@ TEST_F(HybmAsymmetricSegmentTest, ResolveRemoteGva_CoexistingImports_ResolveOwnL
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addrA[1] = {nullptr};
     void *addrB[1] = {nullptr};
-    ASSERT_EQ(segmentA.Import({data}, addrA), BM_OK);
-    ASSERT_EQ(segmentB.Import({data}, addrB), BM_OK);
+    ASSERT_EQ(segmentA.Import({data}, addrA, HYBM_IMPORT_RANK_INVALID), BM_OK);
+    ASSERT_EQ(segmentB.Import({data}, addrB, HYBM_IMPORT_RANK_INVALID), BM_OK);
 
     auto sliceA = segmentA.rankToRemoteSlices_.at(7U).at(0);
     auto sliceB = segmentB.rankToRemoteSlices_.at(7U).at(0);
@@ -907,16 +984,16 @@ TEST_F(HybmAsymmetricSegmentTest, ImportSlice_A5_ReserveFail)
     auto sliceInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addresses[1] = {nullptr};
-    EXPECT_EQ(segment.Import({data}, addresses), BM_ERROR);
+    EXPECT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_ERROR);
     EXPECT_EQ(g_importCount, 1);
     EXPECT_EQ(g_vmmReleaseCount, 1); // imported handle 已释放
-    EXPECT_TRUE(segment.vmmNameToHandle_.empty());
+    EXPECT_TRUE(segment.vmmLvaToHandle_.empty());
     EXPECT_EQ(HybmVaManager::GetInstance().GetReservedCount(), 0U);
 }
 
 /**
  * ImportSlice_A5_MapFail_Rollback
- *  - map 失败：release + freeLva 均被调用，vmmNameToHandle_ 无残留。
+ *  - map 失败：release + freeLva 均被调用，vmmLvaToHandle_ 无残留。
  */
 TEST_F(HybmAsymmetricSegmentTest, ImportSlice_A5_MapFail_Rollback)
 {
@@ -929,9 +1006,9 @@ TEST_F(HybmAsymmetricSegmentTest, ImportSlice_A5_MapFail_Rollback)
     auto sliceInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addresses[1] = {nullptr};
-    EXPECT_EQ(segment.Import({data}, addresses), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_DL_FUNCTION_FAILED);
     EXPECT_EQ(g_vmmReleaseCount, 1);
-    EXPECT_TRUE(segment.vmmNameToHandle_.empty());
+    EXPECT_TRUE(segment.vmmLvaToHandle_.empty());
     EXPECT_EQ(HybmVaManager::GetInstance().GetReservedCount(), 0U);
 }
 
@@ -951,7 +1028,7 @@ TEST_F(HybmAsymmetricSegmentTest, ImportSlice_A5_InvalidNameType)
         sliceInfo.name[0] = static_cast<char>(badType);
         std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
         void *addresses[1] = {nullptr};
-        EXPECT_EQ(segment.Import({data}, addresses), BM_INVALID_PARAM);
+        EXPECT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_INVALID_PARAM);
         EXPECT_EQ(g_importCount, 0);
     }
     EXPECT_TRUE(segment.rankToRemoteSlices_.empty());
@@ -973,19 +1050,67 @@ TEST_F(HybmAsymmetricSegmentTest, ImportSlice_A5_MultiSliceSameRank)
     std::string data1(reinterpret_cast<const char *>(&info1), sizeof(info1));
     std::string data2(reinterpret_cast<const char *>(&info2), sizeof(info2));
     void *addresses[2] = {nullptr, nullptr};
-    EXPECT_EQ(segment.Import({data1, data2}, addresses), BM_OK);
+    EXPECT_EQ(segment.Import({data1, data2}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
 
-    EXPECT_EQ(segment.vmmNameToHandle_.size(), 2U);
+    EXPECT_EQ(segment.vmmLvaToHandle_.size(), 2U);
     EXPECT_EQ(segment.rankToRemoteSlices_.at(7U).size(), 2U);
     EXPECT_EQ(addresses[0], TestAddr(TEST_GVA_BASE + 0x1000000ULL));
     EXPECT_EQ(addresses[1], TestAddr(TEST_GVA_BASE + 0x2000000ULL));
+}
+
+/**
+ * ImportVmmSlice_SameNameAcrossRankWindows
+ *  - 同规格 server 导出的 128B share name 逐字节相同，跨 rank 窗口的同名片只能靠 gva 区分，须各自完整导入；
+ *  - 回归：name 单键记账会被后写覆盖（handle 泄漏），注销时还会释放别人的映射，故按 LVA 记账。
+ */
+TEST_F(HybmAsymmetricSegmentTest, ImportVmmSlice_SameNameAcrossRankWindows)
+{
+    auto options = MakeOptions(HYBM_DOP_TYPE_SDMA, ASCEND_950);
+    AsymmetricMemSegment segment(options, TEST_ENTITY_ID);
+    InitSegmentBase(segment);
+    MockVmmImportPath();
+
+    auto info1 = MakeVmmSliceInfo(0x1000000ULL, 7U);
+    auto info2 = MakeVmmSliceInfo(0x2000000ULL, 8U);
+    // 强制两片共享同一份 share_handle 字节：同规格对端各自分配，导出内容完全相同
+    std::memcpy(info2.name, info1.name, USER_HBM_NAME_MAX_LEN);
+    std::string data1(reinterpret_cast<const char *>(&info1), sizeof(info1));
+    std::string data2(reinterpret_cast<const char *>(&info2), sizeof(info2));
+    void *addresses[2] = {nullptr, nullptr};
+    ASSERT_EQ(segment.Import({data1, data2}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
+
+    EXPECT_EQ(g_importCount, 2);
+    ASSERT_EQ(segment.vmmLvaToHandle_.size(), 2U);
+    const auto lva1 = segment.rankToRemoteSlices_.at(7U).at(0)->vAddress_;
+    const auto lva2 = segment.rankToRemoteSlices_.at(8U).at(0)->vAddress_;
+    ASSERT_NE(lva1, 0U);
+    ASSERT_NE(lva2, 0U);
+    EXPECT_NE(lva1, lva2);
+    ASSERT_EQ(segment.vmmLvaToHandle_.count(lva1), 1U);
+    ASSERT_EQ(segment.vmmLvaToHandle_.count(lva2), 1U);
+    const auto handle1Value = FakeVmmHandleValue(segment.vmmLvaToHandle_.at(lva1));
+    const auto handle2Value = FakeVmmHandleValue(segment.vmmLvaToHandle_.at(lva2));
+    EXPECT_NE(handle1Value, handle2Value);
+
+    ASSERT_EQ(segment.RemoveImported({7U}), BM_OK);
+    EXPECT_EQ(g_vmmReleaseCount, 1);
+    ASSERT_EQ(g_releasedHandles.size(), 1U);
+    EXPECT_EQ(g_releasedHandles[0], handle1Value);
+    EXPECT_EQ(segment.vmmLvaToHandle_.size(), 1U);
+    EXPECT_EQ(segment.vmmLvaToHandle_.count(lva2), 1U);
+
+    ASSERT_EQ(segment.RemoveImported({8U}), BM_OK);
+    EXPECT_EQ(g_vmmReleaseCount, 2);
+    ASSERT_EQ(g_releasedHandles.size(), 2U);
+    EXPECT_EQ(g_releasedHandles[1], handle2Value);
+    EXPECT_TRUE(segment.vmmLvaToHandle_.empty());
 }
 
 // ====================== A5 VMM 共享路径：释放与生命周期 ======================
 
 /**
  * RemoveImported_A5_VmmUnimport
- *  - 移除远端 rank：unmap/release 被调用，vmmNameToHandle_ 清空，LVA 预留归还。
+ *  - 移除远端 rank：unmap/release 被调用，vmmLvaToHandle_ 清空，LVA 预留归还。
  */
 TEST_F(HybmAsymmetricSegmentTest, RemoveImported_A5_VmmUnimport)
 {
@@ -997,12 +1122,12 @@ TEST_F(HybmAsymmetricSegmentTest, RemoveImported_A5_VmmUnimport)
     auto sliceInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addresses[1] = {nullptr};
-    ASSERT_EQ(segment.Import({data}, addresses), BM_OK);
+    ASSERT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
 
     EXPECT_EQ(segment.RemoveImported({7U}), BM_OK);
     EXPECT_EQ(g_unmapCount, 1);
     EXPECT_EQ(g_vmmReleaseCount, 1);
-    EXPECT_TRUE(segment.vmmNameToHandle_.empty());
+    EXPECT_TRUE(segment.vmmLvaToHandle_.empty());
     EXPECT_TRUE(segment.remoteSlices_.empty());
     EXPECT_EQ(HybmVaManager::GetInstance().GetReservedCount(), 0U);
 }
@@ -1021,15 +1146,15 @@ TEST_F(HybmAsymmetricSegmentTest, RemoveImported_A5_Rejoin)
     auto sliceInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addresses[1] = {nullptr};
-    ASSERT_EQ(segment.Import({data}, addresses), BM_OK);
+    ASSERT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
     ASSERT_EQ(segment.RemoveImported({7U}), BM_OK);
 
-    ASSERT_EQ(segment.Import({data}, addresses), BM_OK);
+    ASSERT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
     EXPECT_EQ(g_importCount, 2);
     EXPECT_EQ(g_reserveCount, 2);
     EXPECT_EQ(g_unmapCount, 1);
     EXPECT_EQ(g_vmmReleaseCount, 1);
-    EXPECT_EQ(segment.vmmNameToHandle_.size(), 1U);
+    EXPECT_EQ(segment.vmmLvaToHandle_.size(), 1U);
 }
 
 /**
@@ -1046,7 +1171,7 @@ TEST_F(HybmAsymmetricSegmentTest, CloseMemory_A5_MixedTypes)
     MOCKER(&ock::mf::DlAclApi::RtIpcCloseMemory).stubs().will(invoke(RtIpcCloseMemoryCountStub));
 
     auto vmmInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
-    auto ipcInfo = MakeIpcSliceInfo(0x2000000ULL, 8U);
+    auto ipcInfo = MakeIpcSliceInfo(0x2000000ULL, TEST_EXPORT_RANK);
     UserSliceExportInfo dramInfo{};
     dramInfo.segmentType = SEGMENT_TYPE_USER_DRAM;
     dramInfo.gvaOffset = 0x3000000ULL;
@@ -1057,14 +1182,14 @@ TEST_F(HybmAsymmetricSegmentTest, CloseMemory_A5_MixedTypes)
     std::string ipcData(reinterpret_cast<const char *>(&ipcInfo), sizeof(ipcInfo));
     std::string dramData(reinterpret_cast<const char *>(&dramInfo), sizeof(dramInfo));
     void *addresses[3] = {nullptr, nullptr, nullptr};
-    ASSERT_EQ(segment.Import({vmmData, ipcData, dramData}, addresses), BM_OK);
+    ASSERT_EQ(segment.Import({vmmData, ipcData, dramData}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
     ASSERT_EQ(g_ipcOpenCount, 1);
 
     segment.CloseMemory();
     EXPECT_EQ(g_unmapCount, 1);      // VMM unmap
     EXPECT_EQ(g_vmmReleaseCount, 1); // VMM handle release
     EXPECT_EQ(g_ipcCloseCount, 1);   // IPC close
-    EXPECT_TRUE(segment.vmmNameToHandle_.empty());
+    EXPECT_TRUE(segment.vmmLvaToHandle_.empty());
     EXPECT_TRUE(segment.remoteSlices_.empty());
 }
 
@@ -1085,13 +1210,13 @@ TEST_F(HybmAsymmetricSegmentTest, UnImport_UnregisteredOrRepeat_NoCrash)
     auto sliceInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addresses[1] = {nullptr};
-    ASSERT_EQ(segment.Import({data}, addresses), BM_OK);
+    ASSERT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_OK);
     ASSERT_EQ(segment.remoteSlices_.size(), 1U);
     const auto sliceId = segment.remoteSlices_.begin()->first;
 
     segment.UserMemUnImportName(sliceId);
     EXPECT_EQ(g_unmapCount, 1);
-    EXPECT_TRUE(segment.vmmNameToHandle_.empty());
+    EXPECT_TRUE(segment.vmmLvaToHandle_.empty());
     segment.UserMemUnImportName(sliceId); // 重复 unimport：handle 缺失分支，仅告警不 erase(end())
     EXPECT_EQ(g_unmapCount, 2);
     EXPECT_EQ(g_vmmReleaseCount, 1);
@@ -1113,6 +1238,6 @@ TEST_F(HybmAsymmetricSegmentTest, Import_CrossSoc_A3ReceivesVmmName)
     auto sliceInfo = MakeVmmSliceInfo(0x1000000ULL, 7U);
     std::string data(reinterpret_cast<const char *>(&sliceInfo), sizeof(sliceInfo));
     void *addresses[1] = {nullptr};
-    EXPECT_EQ(segment.Import({data}, addresses), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(segment.Import({data}, addresses, HYBM_IMPORT_RANK_INVALID), BM_DL_FUNCTION_FAILED);
     EXPECT_TRUE(segment.rankToRemoteSlices_.empty());
 }

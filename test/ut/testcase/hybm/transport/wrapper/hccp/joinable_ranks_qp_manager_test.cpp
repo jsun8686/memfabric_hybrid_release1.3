@@ -73,7 +73,8 @@ protected:
         devNet.sin_port = htons(kPort8002);
         inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
         // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-        manager = std::make_unique<TestableJoinableRanksQpManager>(0, 0, K_RANK_ID_0, K_RANK_COUNT, devNet, 0);
+        manager = std::make_unique<TestableJoinableRanksQpManager>(0, 0, K_RANK_ID_0, K_RANK_COUNT, devNet,
+                                                                   HYBM_SCENE_DEFAULT);
     }
 
     void TearDown() override
@@ -141,7 +142,8 @@ TEST_F(JoinableRanksQpManagerTest, RemoveRanksClearsNewClients)
     devNet.sin_family = AF_INET;
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
-    auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, 0);
+    auto clientManager =
+        std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     // 设置远程 rank 2,3 的连接信息 → newClients_ = {2, 3}
     std::unordered_map<uint32_t, ConnectRankInfo> ranks;
@@ -165,31 +167,75 @@ TEST_F(JoinableRanksQpManagerTest, RemoveRanksClearsNewClients)
     EXPECT_TRUE(clientManager->newClients_.count(K_RANK_ID_3));
 }
 
-TEST_F(JoinableRanksQpManagerTest, TransTags_DistinguishRanksSharingAnIp)
+TEST_F(JoinableRanksQpManagerTest, TransTags_SameOnBothEndsCarryServerAddr)
 {
-    sockaddr_in devNet{};
-    devNet.sin_family = AF_INET;
-    devNet.sin_port = htons(K_PORT_8000);
-    inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
-    JoinableRanksQpManager sender(0, 0, 0, 66, devNet, HYBM_ROLE_SENDER);
-    JoinableRanksQpManager receiver(0, 0, 65, 66, devNet, HYBM_ROLE_RECEIVER);
+    // 端口按生产侧约定以主机序写入 sin_port（见 ParseDeviceNic），便于断言 tag 中的端口
+    sockaddr_in serverNet{};
+    serverNet.sin_family = AF_INET;
+    serverNet.sin_port = K_PORT_8000;
+    inet_pton(AF_INET, "127.0.0.1", &serverNet.sin_addr);
+    sockaddr_in clientNet{};
+    clientNet.sin_family = AF_INET;
+    clientNet.sin_port = K_PORT_8001;
+    inet_pton(AF_INET, "127.0.0.1", &clientNet.sin_addr);
 
-    char senderTo64[HCCP_SOCK_CONN_TAG_SIZE]{};
-    char senderTo65[HCCP_SOCK_CONN_TAG_SIZE]{};
-    char receiverTo0[HCCP_SOCK_CONN_TAG_SIZE]{};
-    sender.FillHccpTag(senderTo64, 64);
-    sender.FillHccpTag(senderTo65, 65);
-    receiver.FillHccpTag(receiverTo0, 0);
+    // rank 小端（此处 rank 0）承担 RA server（白名单侧）角色，client 为 rank 65
+    JoinableRanksQpManager server(0, 0, K_RANK_ID_0, 66, serverNet, HYBM_SCENE_TRANS);
+    JoinableRanksQpManager client(0, 0, 65, 66, clientNet, HYBM_SCENE_TRANS);
 
-    EXPECT_STREQ(senderTo64, "TRANS_TAG_0_64");
-    EXPECT_STREQ(senderTo65, "TRANS_TAG_0_65");
-    EXPECT_STREQ(senderTo65, receiverTo0);
-    EXPECT_STRNE(senderTo64, senderTo65);
+    char serverTo64[HCCP_SOCK_CONN_TAG_SIZE]{};
+    char serverTo65[HCCP_SOCK_CONN_TAG_SIZE]{};
+    char clientTo0[HCCP_SOCK_CONN_TAG_SIZE]{};
+    server.FillHccpTag(serverTo64, 64, clientNet);
+    server.FillHccpTag(serverTo65, 65, clientNet);
+    client.FillHccpTag(clientTo0, 0, serverNet);
 
-    JoinableRanksQpManager bmManager(0, 0, 0, 4, devNet, HYBM_ROLE_PEER);
+    // tag 由 server 侧 ip:port 构成（TRANS 一条连接固定一对一，无需再编码 rank）：
+    // server 取自身 deviceAddress_、client 取对端 remoteNet，两端算出的 tag 必须逐字节一致
+    // （RA 侧按 clientIp + tag 匹配白名单，两端不一致则建链失败）
+    EXPECT_STREQ(serverTo64, "TRANS_TAG_127.0.0.1_8000");
+    EXPECT_STREQ(serverTo65, "TRANS_TAG_127.0.0.1_8000");
+    EXPECT_STREQ(clientTo0, "TRANS_TAG_127.0.0.1_8000");
+
+    JoinableRanksQpManager bmManager(0, 0, K_RANK_ID_0, 4, serverNet, HYBM_SCENE_DEFAULT);
     char bmTag[HCCP_SOCK_CONN_TAG_SIZE]{};
-    bmManager.FillHccpTag(bmTag, 1);
+    bmManager.FillHccpTag(bmTag, 1, clientNet);
     EXPECT_STREQ(bmTag, "BM_TAG");
+}
+
+TEST_F(JoinableRanksQpManagerTest, TransTags_DistinguishPeersSharingAnIpWithDifferentPorts)
+{
+    // 同一 IP 上的两个 server 实例（端口不同）：同一进程内 rank 1 的 client 分别与二者建链，
+    // 二者 rank 对相同，修复前 tag 均算作同一条字符串而互相串链；
+    // 改用 server 侧 ip:port 后二者可区分，且各自与对端 server 算出的 tag 一致
+    constexpr uint16_t kServerPortA = 9100;
+    constexpr uint16_t kServerPortB = 9101;
+    sockaddr_in clientNet{};
+    clientNet.sin_family = AF_INET;
+    clientNet.sin_port = K_PORT_8001;
+    inet_pton(AF_INET, "127.0.0.1", &clientNet.sin_addr);
+    sockaddr_in serverANet{};
+    serverANet.sin_family = AF_INET;
+    serverANet.sin_port = kServerPortA;
+    inet_pton(AF_INET, "127.0.0.1", &serverANet.sin_addr);
+    sockaddr_in serverBNet = serverANet;
+    serverBNet.sin_port = kServerPortB;
+
+    JoinableRanksQpManager clientA(0, 0, 1, 2, clientNet, HYBM_SCENE_TRANS);
+    JoinableRanksQpManager clientB(0, 0, 1, 2, clientNet, HYBM_SCENE_TRANS);
+    JoinableRanksQpManager serverA(0, 0, 0, 2, serverANet, HYBM_SCENE_TRANS);
+
+    char clientToA[HCCP_SOCK_CONN_TAG_SIZE]{};
+    char clientToB[HCCP_SOCK_CONN_TAG_SIZE]{};
+    char serverToClient[HCCP_SOCK_CONN_TAG_SIZE]{};
+    clientA.FillHccpTag(clientToA, 0, serverANet);
+    clientB.FillHccpTag(clientToB, 0, serverBNet);
+    serverA.FillHccpTag(serverToClient, 1, clientNet);
+
+    EXPECT_STRNE(clientToA, clientToB);
+    EXPECT_STREQ(clientToA, "TRANS_TAG_127.0.0.1_9100");
+    EXPECT_STREQ(clientToB, "TRANS_TAG_127.0.0.1_9101");
+    EXPECT_STREQ(clientToA, serverToClient);
 }
 
 TEST_F(JoinableRanksQpManagerTest, RemovedRank_CancelsStaleSocketWaitBatch)
@@ -198,7 +244,7 @@ TEST_F(JoinableRanksQpManagerTest, RemovedRank_CancelsStaleSocketWaitBatch)
     devNet.sin_family = AF_INET;
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
-    JoinableRanksQpManager transManager(0, 0, 0, 66, devNet, HYBM_ROLE_SENDER);
+    JoinableRanksQpManager transManager(0, 0, 0, 66, devNet, HYBM_SCENE_TRANS);
 
     sockaddr_in remote{};
     remote.sin_family = AF_INET;
@@ -222,7 +268,7 @@ TEST_F(JoinableRanksQpManagerTest, SameRankReplacementPreservesNewAddressAndCanc
     inet_pton(AF_INET, "10.20.0.2", &oldNet.sin_addr);
     sockaddr_in newNet = oldNet;
     newNet.sin_port = htons(K_PORT_8001);
-    JoinableRanksQpManager manager(0, 0, 0, 66, oldNet, HYBM_ROLE_SENDER);
+    JoinableRanksQpManager manager(0, 0, 0, 66, oldNet, HYBM_SCENE_TRANS);
     ock::mf::transport::TransportMemoryKey key{};
     manager.SetRemoteRankInfo({{64, ConnectRankInfo(HYBM_ROLE_RECEIVER, oldNet, key)}});
     manager.connections_[64].qpStatus = 1;
@@ -246,7 +292,7 @@ TEST_F(JoinableRanksQpManagerTest, ScenarioRegression_NoIpAddressAfterLeave)
     devNet.sin_family = AF_INET;
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
-    auto mgr = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, 0);
+    auto mgr = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     sockaddr_in net{};
     net.sin_family = AF_INET;
@@ -304,7 +350,8 @@ TEST_F(JoinableRanksQpManagerTest, RemoveRanksAfterPipelineFailure)
     devNet.sin_family = AF_INET;
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
-    auto serverManager = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, 0);
+    auto serverManager =
+        std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     // 设置 remote rank 2, 3 的 IP 信息 → newClients_ = {2, 3}
     std::unordered_map<uint32_t, ConnectRankInfo> ranks;
@@ -342,7 +389,8 @@ TEST_F(JoinableRanksQpManagerTest, RemoveRanksClearsNewServers)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // rank 2 作为 client, 连接 server (rank 0, 1)
-    auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(2, 2, 2, K_RANK_COUNT, devNet, 0);
+    auto clientManager =
+        std::make_unique<TestableJoinableRanksQpManager>(2, 2, 2, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     std::unordered_map<uint32_t, ConnectRankInfo> ranks;
     sockaddr_in net{};
@@ -447,7 +495,8 @@ TEST_F(JoinableRanksQpManagerTest, StartupClient)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-    auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, 0);
+    auto clientManager =
+        std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
     clientManager->Startup(fakeRdma);
     std::this_thread::sleep_for(std::chrono::milliseconds(K_OUT_OF_RANGE_RANK));
     clientManager->Shutdown();
@@ -479,7 +528,8 @@ TEST_F(JoinableRanksQpManagerTest, ServerSideHandleNewClients)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-    auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(0, 0, K_RANK_ID_0, K_RANK_COUNT, devNet, 0);
+    auto clientManager =
+        std::make_unique<TestableJoinableRanksQpManager>(0, 0, K_RANK_ID_0, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     // 设置remoet 连接信息【2，3】
     std::unordered_map<uint32_t, ock::mf::transport::device::ConnectRankInfo> ranks;
@@ -555,7 +605,7 @@ TEST_F(JoinableRanksQpManagerTest, WaitSocketConnections)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-    auto clientManager = std::make_unique<JoinableRanksQpManager>(0, 0, 0, K_RANK_COUNT, devNet, 0);
+    auto clientManager = std::make_unique<JoinableRanksQpManager>(0, 0, 0, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     // 设置remoet 连接信息【1，1】
     std::unordered_map<uint32_t, ock::mf::transport::device::ConnectRankInfo> ranks;
@@ -587,7 +637,7 @@ TEST_F(JoinableRanksQpManagerTest, MakeQpConnections)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-    auto clientManager = std::make_unique<JoinableRanksQpManager>(0, 0, 0, K_RANK_COUNT, devNet, 0);
+    auto clientManager = std::make_unique<JoinableRanksQpManager>(0, 0, 0, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
     std::set<uint32_t> newRanks = {K_RANK_ID_0, K_RANK_ID_1, K_RANK_ID_2};
 
     // 设置remoet 连接信息【1，1】
@@ -623,7 +673,8 @@ TEST_F(JoinableRanksQpManagerTest, WaitQpConnections)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-    auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, 0);
+    auto clientManager =
+        std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     clientManager->connections_.resize(K_RANK_COUNT); // 模拟已有连接状态
     clientManager->connections_[K_RANK_ID_3].qpHandle = ToVoidPtr(0x2222);
@@ -646,7 +697,8 @@ TEST_F(JoinableRanksQpManagerTest, GenerateWhiteList)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-    auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, 0);
+    auto clientManager =
+        std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     // 设置remoet 连接信息【2，3】
     std::unordered_map<uint32_t, ock::mf::transport::device::ConnectRankInfo> ranks;
@@ -673,7 +725,8 @@ TEST_F(JoinableRanksQpManagerTest, GenerateWhiteListEmpty)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-    auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, 0);
+    auto clientManager =
+        std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     // 设置remoet 连接信息【2，3】
     std::unordered_map<uint32_t, ock::mf::transport::device::ConnectRankInfo> ranks;
@@ -703,7 +756,8 @@ TEST_F(JoinableRanksQpManagerTest, CreateConnectionToServers)
     devNet.sin_port = htons(K_PORT_8000);
     inet_pton(AF_INET, "127.0.0.1", &devNet.sin_addr);
     // uint32_t userDeviceId, uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet
-    auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(2, 2, 2, K_RANK_COUNT, devNet, 0);
+    auto clientManager =
+        std::make_unique<TestableJoinableRanksQpManager>(2, 2, 2, K_RANK_COUNT, devNet, HYBM_SCENE_DEFAULT);
 
     // 设置server连接信息【0卡是server】
     std::unordered_map<uint32_t, ock::mf::transport::device::ConnectRankInfo> ranks;
@@ -743,7 +797,7 @@ sockaddr_in MakeAiDevNet(uint16_t port)
 std::unique_ptr<AicpuJoinableRanksQpManager> MakeAiManager(uint32_t rankCount = K_RANK_COUNT)
 {
     return std::make_unique<AicpuJoinableRanksQpManager>(0, 0, K_RANK_ID_0, rankCount, MakeAiDevNet(K_AI_PORT),
-                                                         HYBM_ROLE_PEER);
+                                                         HYBM_SCENE_DEFAULT);
 }
 
 struct AicpuQpApiGuard {

@@ -78,12 +78,11 @@ public:
                      uint32_t flags) noexcept override;
     int32_t BatchCopyData(hybm_batch_copy_params &params, hybm_data_copy_direction direction, void *stream,
                           uint32_t flags) noexcept override;
-    int32_t QuantCopy(hybm_quant_copy_params &params) noexcept override;
     int32_t Wait() noexcept override;
 
     bool SdmaReaches(uint32_t remoteRank) const noexcept override;
     hybm_data_op_type CanReachDataOperators(uint32_t remoteRank) const noexcept override;
-    void *GetSliceVa(hybm_mem_slice_t slice);
+    void *GetSliceVa(hybm_mem_slice_t slice, uint32_t flags);
     uint64_t GetSliceSize(hybm_mem_slice_t slice);
     int32_t ConnectTransport(const uint32_t *ranks, uint32_t count, uint32_t flags) noexcept override;
     int32_t UnmapRank(uint32_t rankId) noexcept override;
@@ -94,7 +93,8 @@ private:
     int32_t UpdateHybmDeviceInfo(uint32_t extCtxSize) noexcept;
     void SetHybmDeviceInfo(HybmDeviceMeta &info);
     int32_t ImportForTransport() noexcept;
-    int32_t ImportForSegment(const ExchangeInfoReader desc[], uint32_t count, void *addresses[]) noexcept;
+    int32_t ImportForSegment(const ExchangeInfoReader desc[], uint32_t count, void *addresses[],
+                             uint32_t overrideRank = HYBM_IMPORT_RANK_INVALID) noexcept;
     Result LocateAddrAndRank(void *&src, void *&dest, std::pair<uint32_t, uint32_t> &p2pInfo) noexcept;
 
     Result InitSegment();
@@ -108,7 +108,8 @@ private:
     int32_t SetThreadAclDevice();
     int32_t ImportForTagManager();
     int32_t ImportForTransportManager();
-    int32_t ImportForTransportPrecheck(const ExchangeInfoReader *desc, uint32_t &count, void *addresses[]);
+    int32_t ImportForTransportPrecheck(const ExchangeInfoReader *desc, uint32_t &count, void *addresses[],
+                                       uint32_t overrideRank);
 
 private:
     static thread_local bool isSetDevice_;
