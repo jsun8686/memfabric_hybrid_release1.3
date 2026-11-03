@@ -17,10 +17,17 @@ copy_data / destroy`。
 
 ## 必要条件
 - 两节点已安装同版本 memfabric_hybrid whl，网络互通。
-- host 模式（默认）data_op_type=HOST_RDMA：需节点间 RDMA（RoCE/IB）NIC；无 RDMA 环境可改为 HOST_TCP（吞吐下降）。
-- device 模式追加 `device` 参数：data_op_type=SDMA|DEVICE_RDMA，需 NPU+CANN（ASCEND_NPU 构建）环境；预留
-  **HBM-only 窗**——A2(910B) SoC 上 DRAM 窗与 SDMA 位互斥（hybm conn-based DRAM 段无设备坐标，SDMA 不可达；
-  910C/GVA_V4 统一编址解除）。
+- host 模式（默认）data_op_type=HOST_RDMA：DRAM 介质，需节点间 RDMA（RoCE/IB）NIC；无 RDMA 环境可改为 HOST_TCP（吞吐下降）。
+- device 模式追加 `device` 参数：data_op_type=SDMA|DEVICE_RDMA，HBM 介质，需 NPU+CANN（ASCEND_NPU 构建）环境；
+  预留 **HBM-only 窗**——A2(910B) SoC 上 DRAM 窗与 SDMA 位互斥（hybm conn-based DRAM 段无设备坐标，SDMA 不可达；
+  910C/A5 统一编址解除该限制）。
+
+## 端口与地址清单
+| 用途 | 取值 | 说明 |
+|---|---|---|
+| config store | tcp://\<head_ip\>:8572 | head(rank0) 宿主；承载 RA_ 前缀键、MASTER 端点发现与组事件流 |
+| ralloc 控制面 RPC | 11100 + rankId | 默认 rpc_port_base=11100（head=11100 / node B=11101），两节点各起一个 acc_tcp server |
+| hcom/nic 传输端点 | tcp://\<各自节点IP\>:10005 | 端口为 hcom 基址；head 取运行参数 head_ip，node B 由脚本自动探测本机 hostname |
 
 ## 验收标准
 - head 输出 "round-trip via FAR block OK"（远端块写读一致）且 `get_group_ranks() == [0, 1]`。

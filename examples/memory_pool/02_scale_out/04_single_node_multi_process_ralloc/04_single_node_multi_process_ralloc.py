@@ -22,7 +22,8 @@ EXTEND_LOCAL_BYTES = 32 * 1024 * 1024   # 32MB block on the NEAR local slot
 EXTEND_REMOTE_BYTES = 64 * 1024 * 1024  # 64MB block contributed by the FAR node
 EXTEND_REMOTE_AGAIN = 32 * 1024 * 1024  # 32MB second remote block (executor extend branch)
 COPY_BYTES = 4 * 1024 * 1024  # 4MB int32 payload
-STORE_URL = "tcp://127.0.0.1:8572"
+STORE_URL = "tcp://127.0.0.1:8572"  # config store hosted by the FAR rank, also carries master discovery
+NIC_PORT_BASE = 10005               # hcom/nic endpoint base port, ip auto-detected from this node
 WORLD_SIZE = 2
 
 RANK_FAR, DEVICE_ID = 0, 0
@@ -30,14 +31,23 @@ RANK_NEAR = 1
 
 
 def _media_config(media):
-    """host (default): HOST media via HOST_RDMA; device: HBM media via SDMA (NPU required).
-    The device variant reserves an HBM-only window: on A2(910B) SoCs a DRAM window cannot carry the
-    SDMA bit — the hybm conn-based dram segment is not sdma-reachable (910C/GVA_V4 unified VA除外)."""
+    """host (default): DRAM media via HOST_TCP, single-machine loopback, no RDMA/NPU needed;
+    device: HBM media via SDMA (NPU+CANN required, async copies converge via wait).
+    The device variant reserves an HBM-only window: on A2(910B) SoCs a DRAM window cannot carry
+    the SDMA bit -- the hybm conn-based dram segment is not sdma-reachable (910C/A5 unified VA
+    addressing lifts the restriction)."""
     if media == "device":
         return (ralloc.RallocMemType.DEVICE,
                 ralloc.RallocDataOpType.SDMA,
                 0, ONE_GIB)
-    return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, ONE_GIB, 0
+    return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_TCP, ONE_GIB, 0
+
+
+def _local_nic_url():
+    """hcom/nic endpoint of this node, passed down as the hybm transUrl of the pool."""
+    import socket
+
+    return f"tcp://{socket.gethostbyname(socket.gethostname())}:{NIC_PORT_BASE}"
 
 
 def _wait_for_store(timeout_sec=60.0):
@@ -66,7 +76,7 @@ def _near_main(sync: mp.Barrier, media: str, enable56: bool = False):
         cfg.auto_ranking = False
         cfg.role = ralloc.RallocRole.NEAR
         cfg.start_store = False  # FAR (rank 0) hosts the store and the master service
-        cfg.set_nic("tcp://174.111.50.202:10005")
+        cfg.set_nic(_local_nic_url())
         _wait_for_store()  # master discovery inside initialize needs the FAR-hosted store
         assert ralloc.initialize(STORE_URL, WORLD_SIZE, DEVICE_ID, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
@@ -133,7 +143,7 @@ def _far_main(sync: mp.Barrier, media: str):
         cfg.auto_ranking = False
         cfg.role = ralloc.RallocRole.FAR
         cfg.start_store = True  # rank 0 hosts the store; master seeds itself, loopback accounting
-        cfg.set_nic("tcp://174.111.50.202:10005")
+        cfg.set_nic(_local_nic_url())
         assert ralloc.initialize(STORE_URL, WORLD_SIZE, DEVICE_ID, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
         print(f"[rank {RANK_FAR}] ralloc initialized (FAR: store host + master + contributor)", flush=True)
@@ -153,7 +163,7 @@ def main():
     media = argv[0] if argv else "host"
     enable56 = "--enable-56bits-gva" in argv
     if media not in ("host", "device"):
-        raise RuntimeError("usage: python 03_single_node_multi_process_ralloc.py [host|device] "
+        raise RuntimeError("usage: python 04_single_node_multi_process_ralloc.py [host|device] "
                            "[--enable-56bits-gva]")
     mp.set_start_method("spawn", force=True)
     sync = mp.Barrier(WORLD_SIZE)
@@ -168,7 +178,7 @@ def main():
 
     if p_near.exitcode != 0 or p_far.exitcode != 0:
         raise RuntimeError(f"child failed: near={p_near.exitcode}, far={p_far.exitcode}")
-    print(f"(5/5) 03_single_node_multi_process_ralloc [{media}, 56bits={enable56}]: NEAR+FAR OK", flush=True)
+    print(f"(5/5) 04_single_node_multi_process_ralloc [{media}, 56bits={enable56}]: NEAR+FAR OK", flush=True)
 
 
 if __name__ == "__main__":

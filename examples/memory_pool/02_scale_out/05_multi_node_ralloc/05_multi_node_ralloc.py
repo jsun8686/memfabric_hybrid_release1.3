@@ -18,6 +18,7 @@ import memfabric_hybrid as mf
 from memfabric_hybrid import ralloc
 
 STORE_PORT = 8572
+NIC_PORT_BASE = 10005  # hcom/nic endpoint base port, node B's ip auto-detected, head uses head_ip
 ONE_GIB = 1 << 30  # 1GB window slot per rank
 EXTEND_REMOTE_BYTES = 64 * 1024 * 1024  # 64MB block contributed by the FAR node
 COPY_BYTES = 4 * 1024 * 1024  # 4MB int32 payload
@@ -29,14 +30,26 @@ FAR_WAIT_RETRY_SEC = 5
 
 
 def _media_config(media):
-    """host (default): HOST media via HOST_RDMA; device: HBM media via SDMA|DEVICE_RDMA (NPU required).
-    The device variant reserves an HBM-only window: on A2(910B) SoCs a DRAM window cannot carry the
-    SDMA bit — the hybm conn-based dram segment is not sdma-reachable (910C/GVA_V4 unified VA除外)."""
+    """host (default): DRAM media via HOST_TCP, no RDMA NIC needed (throughput is lower);
+    rdma: DRAM media via HOST_RDMA, needs an RDMA (RoCE/IB) NIC between the nodes;
+    device: HBM media via SDMA|DEVICE_RDMA (NPU+CANN required, async copies converge via wait).
+    The device variant reserves an HBM-only window: on A2(910B) SoCs a DRAM window cannot carry
+    the SDMA bit -- the hybm conn-based dram segment is not sdma-reachable (910C/A5 unified VA
+    addressing lifts the restriction)."""
     if media == "device":
         return (ralloc.RallocMemType.DEVICE,
                 ralloc.RallocDataOpType.SDMA | ralloc.RallocDataOpType.DEVICE_RDMA,
                 0, ONE_GIB)
-    return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, ONE_GIB, 0
+    if media == "rdma":
+        return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, ONE_GIB, 0
+    return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_TCP, ONE_GIB, 0
+
+
+def _local_nic_url():
+    """hcom/nic endpoint of this node (node B side), passed down as the hybm transUrl of the pool."""
+    import socket
+
+    return f"tcp://{socket.gethostbyname(socket.gethostname())}:{NIC_PORT_BASE}"
 
 
 def _run_near(head_node_ip: str, media: str, enable56: bool = False) -> None:
@@ -51,7 +64,7 @@ def _run_near(head_node_ip: str, media: str, enable56: bool = False) -> None:
         cfg.auto_ranking = False  # fixed identities: head is rank 0, node B is rank 1
         cfg.role = ralloc.RallocRole.NEAR
         cfg.start_store = True  # head hosts the store; master service runs in this process
-        cfg.set_nic("tcp://174.111.50.205:10005")
+        cfg.set_nic(f"tcp://{head_node_ip}:{NIC_PORT_BASE}")  # the head's own nic endpoint
         assert ralloc.initialize(store_url, WORLD_SIZE, 0, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
 
@@ -118,7 +131,7 @@ def _run_far(head_node_ip: str) -> None:
         cfg.auto_ranking = False  # fixed identities: head is rank 0, node B is rank 1
         cfg.role = ralloc.RallocRole.FAR
         cfg.start_store = False
-        cfg.set_nic("tcp://174.111.50.202:10005")
+        cfg.set_nic(_local_nic_url())  # node B's own nic endpoint (auto-detected)
         assert ralloc.initialize(store_url, WORLD_SIZE, 0, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
         print(f"[far] contributor ready (registered with master at {store_url})", flush=True)
@@ -140,13 +153,16 @@ def main() -> None:
     if "device" in args:
         media = "device"
         args.remove("device")
+    elif "rdma" in args:
+        media = "rdma"
+        args.remove("rdma")
     elif "host" in args:
         args.remove("host")
     enable56 = "--enable-56bits-gva" in args
     if enable56:
         args.remove("--enable-56bits-gva")
     if len(args) < 1 or args[0] not in ("0", "1"):
-        raise RuntimeError("usage: python3 04_multi_node_ralloc.py <0|1> [head_ip] [host|device] "
+        raise RuntimeError("usage: python3 05_multi_node_ralloc.py <0|1> [head_ip] [host|rdma|device] "
                            "[--enable-56bits-gva]")
     head_ip = (args[1] if len(args) > 1 else input("Head node IP: ")).strip()
     if not head_ip:

@@ -20,9 +20,17 @@ get_mem_size_by_rank / get_mem_ptr_by_rank / copy_data / wait(仅 device) / dest
 
 ## 必要条件
 - 已安装 memfabric_hybrid whl（含 ralloc 子模块）。
-- host 模式（默认）data_op_type=HOST_TCP：单机进程间走本地 TCP 路径，无需 NPU/RDMA；有 RDMA 环境可改 HOST_RDMA。
-- device 模式 data_op_type=SDMA|DEVICE_RDMA：需 NPU+CANN（ASCEND_NPU 构建）环境；预留 **HBM-only 窗**——
-  A2(910B) SoC 上 DRAM 窗与 SDMA 位互斥（hybm conn-based DRAM 段无设备坐标，SDMA 不可达；910C/GVA_V4 统一编址解除）。
+- host 模式（默认）data_op_type=HOST_TCP：DRAM 介质走单机本地 TCP 路径，无需 NPU/RDMA。
+- device 模式 data_op_type=SDMA：HBM 介质，需 NPU+CANN（ASCEND_NPU 构建）环境，异步拷贝经 wait 收敛；
+  预留 **HBM-only 窗**——A2(910B) SoC 上 DRAM 窗与 SDMA 位互斥（hybm conn-based DRAM 段无设备坐标，
+  SDMA 不可达；910C/A5 统一编址解除该限制）。
+
+## 端口与地址清单
+| 用途 | 取值 | 说明 |
+|---|---|---|
+| config store | tcp://127.0.0.1:8572 | FAR(rank0) 宿主；承载 RA_ 前缀键、MASTER 端点发现与组事件流 |
+| ralloc 控制面 RPC | 11100 + rankId | 默认 rpc_port_base=11100（rank0=11100 / rank1=11101），两进程各起一个 acc_tcp server |
+| hcom/nic 传输端点 | tcp://<本机IP>:10005 | 端口为 hcom 基址，IP 由脚本自动探测本机 hostname，传给 hybm 作 transUrl |
 
 ## 验收标准
 - 输出 5/5 检查点全部通过，两子进程 exitcode=0。
