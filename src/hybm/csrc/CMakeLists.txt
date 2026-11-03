@@ -40,10 +40,10 @@ include_directories(
 set(HYBM_PUBLIC_INCLUDE_DIR "${PROJECT_HYBM_SRC_BASE}/include")
 
 ## add files into src variables
-file(GLOB_RECURSE HYBMM_SRC_FILES CONFIGURE_DEPENDS
+file(GLOB_RECURSE HYBMM_SRC_FILES
         ${PROJECT_HYBM_SRC_BASE}/csrc/*.cpp
         ${PROJECT_HYBM_SRC_BASE}/csrc/*.h
-)
+        )
 list(FILTER HYBMM_SRC_FILES EXCLUDE REGEX ${PROJECT_HYBM_SRC_BASE}/csrc/copy_extend/*)
 list(FILTER HYBMM_SRC_FILES EXCLUDE REGEX "${PROJECT_HYBM_SRC_BASE}/csrc/driver/npu_direct_rdma/.*")
 list(APPEND HYBMM_SRC_FILES ${PROJECT_UTIL_SRC_BASE}/mf_fault_injection_point.cpp)
