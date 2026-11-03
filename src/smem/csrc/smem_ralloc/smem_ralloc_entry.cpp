@@ -699,7 +699,7 @@ Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t 
         // 4.fill info with the new block (mutex_ already held, do not call other locking methods);
         // the block address crosses ranks as a device endpoint: with 56-bit GVA enabled the
         // slice's local-access va differs from its gva -- take the gva
-        auto newGva = hybm_get_slice_gva(entity_, slice);
+        auto newGva = hybm_get_slice_va(entity_, slice, HYBM_GET_SLICE_GVA);
         if (newGva == nullptr) {
             SM_LOG_ERROR("Failed to get slice va, slice:" << slice);
             return SM_ERROR;
@@ -738,7 +738,7 @@ Result SmemRallocEntry::GetLocalMemInfo(smem_ralloc_mem_info_t *info)
     }
     /* first local block = own slot base, not the window base (rank0 slot base); the gva is
      * the cross-rank device endpoint -- with 56-bit GVA it differs from the local-access va */
-    auto gva = hybm_get_slice_gva(entity_, slices_[0]);
+    auto gva = hybm_get_slice_va(entity_, slices_[0], HYBM_GET_SLICE_GVA);
     if (gva == nullptr) {
         SM_LOG_ERROR("Failed to get first slice va, slice:" << slices_[0]);
         return SM_ERROR;
