@@ -58,6 +58,8 @@ public:
     virtual bool SdmaReaches(uint32_t remoteRank) const noexcept = 0;
     virtual hybm_data_op_type CanReachDataOperators(uint32_t remoteRank) const noexcept = 0;
 
+    virtual uint32_t QueryRankByGva(uint64_t gva) const noexcept = 0;
+
     virtual int32_t CopyData(hybm_copy_params &params, hybm_data_copy_direction direction, void *stream,
                              uint32_t flags) noexcept = 0;
     virtual int32_t BatchCopyData(hybm_batch_copy_params &params, hybm_data_copy_direction direction, void *stream,

@@ -1,0 +1,105 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+#ifndef MEMFABRIC_HYBRID_SMEM_RALLOC_MASTER_H
+#define MEMFABRIC_HYBRID_SMEM_RALLOC_MASTER_H
+
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <vector>
+
+#include "smem_config_store.h"
+#include "smem_ralloc_def.h"
+#include "smem_ralloc_rpc_def.h"
+
+namespace ock {
+namespace smem {
+/*
+ * Master service of ralloc: pure rpc service, not a member of any pool.
+ * Op handlers are registered by the rpc service on every node; the node hosting the
+ * config store server activates the master role (on tcp stores that host is fixed at
+ * init by the explicit rank-0 configuration or the racing winner).
+ * It publishes its rpc endpoint under the RA_ prefixed store, keeps the candidate
+ * table of FAR nodes (with their last reported committed bytes, in-flight grants
+ * and last-seen time) and answers PLACEMENT with the least loaded node (reported
+ * committed bytes plus optimistically added in-flight grants, capacity-filtered
+ * against the requester pool window). Dead candidates are dropped
+ * via the store rank-down watch (seconds) and the placement-time stale prune (90s).
+ */
+class SmemRallocMasterService {
+public:
+    static SmemRallocMasterService &Instance();
+
+    SmemRallocMasterService() = default;
+    ~SmemRallocMasterService() = default;
+
+    SmemRallocMasterService(const SmemRallocMasterService &) = delete;
+    SmemRallocMasterService(SmemRallocMasterService &&) = delete;
+    SmemRallocMasterService &operator=(const SmemRallocMasterService &other) = delete;
+    SmemRallocMasterService &operator=(SmemRallocMasterService &&other) = delete;
+
+    /* store: RA_ prefixed store; selfEp: local rpc endpoint; seedSelf: seed self as placement
+     * candidate, only meaningful when the node role is FAR */
+    Result Start(const StorePtr &store, const SmemRallocRpcEndpoint &selfEp, bool seedSelf);
+
+    void Stop();
+
+    bool IsRunning() const;
+
+    /* rpc dispatch entries, invoked by the rpc service lambdas on every node */
+    Result OnRegister(SmemRallocRpcMsg &msg);
+
+    Result OnPlacement(SmemRallocRpcMsg &msg);
+
+    /* contributor notifies that a granted block failed to land (extend/create failed on the
+     * executor): drop the matching optimistic reservation so the load view recovers before
+     * the TTL backstop; unknown node / no matching grant is a benign no-op */
+    Result OnGrantFail(SmemRallocRpcMsg &msg);
+
+    /* local callback fed by the store rank-down watch: erase the candidate whose store
+     * link broke (store heartbeat detects death in seconds); idempotent, a transient
+     * flap self-heals on the node's next periodic REGISTER */
+    void OnRankDown(uint32_t rank);
+
+private:
+    /* one optimistically added placement grant: issued by OnPlacement, confirmed (dropped)
+     * by the growth of the candidate's next REGISTER report, actively released by the
+     * executor's GRANT_FAIL when its extend failed, expired by TTL when the NACK/report
+     * was lost and the grant will never land */
+    struct InflightGrant {
+        uint64_t size;                              /* granted bytes */
+        smem_ralloc_mem_type media;                 /* grant media (HOST / DEVICE) */
+        std::chrono::steady_clock::time_point at;   /* grant time */
+    };
+
+    struct Candidate {
+        SmemRallocRpcEndpoint ep{};
+        uint64_t committedBytes = 0;       /* committed bytes on the HOST media, last reported value */
+        uint64_t deviceCommittedBytes = 0; /* committed bytes on the DEVICE media, last reported value */
+        std::vector<InflightGrant> inflight; /* grants issued since the last report, see above */
+        std::chrono::steady_clock::time_point lastSeen{}; /* refreshed by every periodic REGISTER */
+    };
+
+    static uint64_t SumInflight(const std::vector<InflightGrant> &inflight, smem_ralloc_mem_type media);
+
+    /* entries are append-ordered, drop the oldest media-matching grants first until the
+     * media sum fits keepSum */
+    static void ShrinkInflight(std::vector<InflightGrant> &inflight, smem_ralloc_mem_type media, uint64_t keepSum);
+
+    std::mutex mutex_;
+    std::map<uint32_t, Candidate> candidates_;
+    bool running_ = false;
+};
+} // namespace smem
+} // namespace ock
+
+#endif // MEMFABRIC_HYBRID_SMEM_RALLOC_MASTER_H

@@ -19,13 +19,15 @@
 5. 01_basic/05_no_xpu_host_urma_dram_pool
 6. 02_scale_out/01_single_node_multi_device_dram
 7. 02_scale_out/02_multi_node_multi_device_dram
-8. 03_optimization/01_copy_data_batch
-9. 03_optimization/02_register
-10. 03_optimization/03_device_sdma
-11. 04_features/01_enable_unified_address_space
-12. 05_observability/01_prometheus_grafana
-13. 05_observability/02_opentelemetry
-14. 05_observability/03_dashboards
+8. 02_scale_out/04_single_node_multi_process_ralloc
+9. 02_scale_out/05_multi_node_ralloc
+10. 03_optimization/01_copy_data_batch
+11. 03_optimization/02_register
+12. 03_optimization/03_device_sdma
+13. 04_features/01_enable_unified_address_space
+14. 05_observability/01_prometheus_grafana
+15. 05_observability/02_opentelemetry
+16. 05_observability/03_dashboards
 
 ## 统一约束
 

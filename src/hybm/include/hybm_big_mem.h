@@ -106,6 +106,23 @@ void *hybm_get_slice_va(hybm_entity_t e, hybm_mem_slice_t slice, uint32_t flags)
 uint64_t hybm_get_slice_size(hybm_entity_t e, hybm_mem_slice_t slice);
 
 /**
+ * @brief Query the allocated ranges inside [gvaBegin, gvaEnd) of the GVA space, sorted by
+ *        gva ascending. Local and imported slices of every entity in the process are all
+ *        covered; ownerRank is resolved from the window layout of the given entity's
+ *        segments and is UINT32_MAX when the address falls into none of its windows.
+ *
+ * @param e                [in] entity created by hybm_create_entity, used for rank resolution
+ * @param gvaBegin         [in] begin of the query envelope (inclusive)
+ * @param gvaEnd           [in] end of the query envelope (exclusive)
+ * @param ranges           [out] caller buffer for the results, can be null with *inOutCount 0
+ * @param inOutCount       [in,out] buffer capacity in element on input, written count on output
+ * @return 0 if successful, BM_BUFFER_TOO_SMALL with the needed count written back when the
+ *         buffer is insufficient
+ */
+int32_t hybm_query_alloc_ranges(hybm_entity_t e, uint64_t gvaBegin, uint64_t gvaEnd,
+                                hybm_va_range ranges[], uint32_t *inOutCount);
+
+/**
  * @brief Register memory at local side, registered memory can be accessed by remote.
  * @param e                [in] entity created by hybm_create_entity
  * @param ptr              [in] local memory start address

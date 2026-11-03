@@ -15,6 +15,7 @@ include_directories(
         ${PROJECT_SMEM_SRC_BASE}/csrc/net
         ${PROJECT_SMEM_SRC_BASE}/csrc/smem_shm
         ${PROJECT_SMEM_SRC_BASE}/csrc/smem_trans
+        ${PROJECT_SMEM_SRC_BASE}/csrc/smem_ralloc
         ${PROJECT_HYBM_SRC_BASE}/include
         ${PROJECT_HYBM_SRC_BASE}/csrc/common
         ${PROJECT_HYBM_SRC_BASE}/csrc/transport/device/urma
@@ -28,6 +29,7 @@ file(GLOB_RECURSE PLATFORM_SRC
         ${PROJECT_SMEM_SRC_BASE}/csrc/smem_shm/*.cpp
         ${PROJECT_SMEM_SRC_BASE}/csrc/smem_bm/*.cpp
         ${PROJECT_SMEM_SRC_BASE}/csrc/smem_trans/*.cpp
+        ${PROJECT_SMEM_SRC_BASE}/csrc/smem_ralloc/*.cpp
         ${PROJECT_SMEM_SRC_BASE}/csrc/smem.cpp
 )
 

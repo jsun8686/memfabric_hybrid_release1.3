@@ -12,6 +12,7 @@
 #include "hybm_logger.h"
 #include "hybm_entity_factory.h"
 #include "hybm_big_mem.h"
+#include "hybm_va_manager.h"
 #include "dl_hal_api.h"
 #include "hybm_ex_info_transfer.h"
 
@@ -89,6 +90,35 @@ HYBM_API uint64_t hybm_get_slice_size(hybm_entity_t e, hybm_mem_slice_t slice)
     auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
     BM_ASSERT_LOG_AND_RETURN(entity != nullptr, "entity is nullptr", 0);
     return entity->GetSliceSize(slice);
+}
+
+HYBM_API int32_t hybm_query_alloc_ranges(hybm_entity_t e, uint64_t gvaBegin, uint64_t gvaEnd,
+                                         hybm_va_range ranges[], uint32_t *inOutCount)
+{
+    BM_ASSERT_LOG_AND_RETURN(e != nullptr, "e is nullptr", BM_INVALID_PARAM);
+    auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
+    BM_ASSERT_LOG_AND_RETURN(entity != nullptr, "entity is nullptr", BM_INVALID_PARAM);
+    BM_ASSERT_LOG_AND_RETURN(inOutCount != nullptr, "inOutCount is nullptr", BM_INVALID_PARAM);
+    BM_ASSERT_LOG_AND_RETURN(ranges != nullptr || *inOutCount == 0U, "ranges is nullptr", BM_INVALID_PARAM);
+
+    if (gvaBegin >= gvaEnd) {
+        *inOutCount = 0U;
+        return BM_OK;
+    }
+
+    auto infos = HybmVaManager::GetInstance().QueryAllocRanges(gvaBegin, gvaEnd);
+    if (infos.size() > *inOutCount) {
+        *inOutCount = static_cast<uint32_t>(infos.size());
+        return BM_BUFFER_TOO_SMALL;
+    }
+    for (size_t i = 0; i < infos.size(); i++) {
+        ranges[i].gva = infos[i].base.va[HVM_GVA];
+        ranges[i].size = infos[i].base.size;
+        ranges[i].memType = infos[i].base.memType;
+        ranges[i].ownerRank = entity->QueryRankByGva(infos[i].base.va[HVM_GVA]);
+    }
+    *inOutCount = static_cast<uint32_t>(infos.size());
+    return BM_OK;
 }
 
 HYBM_API hybm_mem_slice_t hybm_alloc_local_memory(hybm_entity_t e, hybm_mem_type mType, uint64_t size, uint32_t flags)

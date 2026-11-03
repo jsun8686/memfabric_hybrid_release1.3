@@ -87,6 +87,8 @@ public:
     int32_t ConnectTransport(const uint32_t *ranks, uint32_t count, uint32_t flags) noexcept override;
     int32_t UnmapRank(uint32_t rankId) noexcept override;
 
+    uint32_t QueryRankByGva(uint64_t gva) const noexcept override;
+
 private:
     static int CheckOptions(const hybm_options *options) noexcept;
     int32_t LoadExtendLibrary() noexcept;

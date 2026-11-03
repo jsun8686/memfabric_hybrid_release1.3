@@ -171,6 +171,8 @@ public:
 
     uint32_t GetRankSize() const;
 
+    void GetMemberRanks(std::vector<uint32_t> &rankIds) const;
+
     void GroupSnClean();
 
 private:

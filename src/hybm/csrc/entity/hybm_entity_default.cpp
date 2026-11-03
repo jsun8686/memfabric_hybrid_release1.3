@@ -1240,6 +1240,16 @@ Result MemEntityDefault::LocateAddrAndRank(void *&src, void *&dest, std::pair<ui
     return BM_OK;
 }
 
+uint32_t MemEntityDefault::QueryRankByGva(uint64_t gva) const noexcept
+{
+    uint32_t rank = 0;
+    if ((hbmSegment_ != nullptr && hbmSegment_->FindRemoteRankByVa(gva, rank)) ||
+        (dramSegment_ != nullptr && dramSegment_->FindRemoteRankByVa(gva, rank))) {
+        return rank;
+    }
+    return UINT32_MAX;
+}
+
 Result MemEntityDefault::InitSegment()
 {
     BM_LOG_DEBUG("Initialize segment with type: " << std::hex << options_.memType);

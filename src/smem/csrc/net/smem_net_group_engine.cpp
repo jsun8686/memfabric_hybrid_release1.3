@@ -1621,6 +1621,19 @@ void SmemNetGroupEngine::GetAllRanksFromBitMap(std::vector<uint32_t> &rankIds)
     }
 }
 
+void SmemNetGroupEngine::GetMemberRanks(std::vector<uint32_t> &rankIds) const
+{
+    rankIds.clear();
+    std::shared_lock<std::shared_mutex> lock{groupInfoMutex_};
+    for (uint32_t i = 0; i < RANK_BITS_U64_COUNT; i++) {
+        for (uint32_t j = 0; j < BITS_COUNT_IN_U64; j++) {
+            if ((groupInfo_.joinedRanksBitmap[i] >> j) & 1U) {
+                rankIds.push_back(i * BITS_COUNT_IN_U64 + j);
+            }
+        }
+    }
+}
+
 int32_t SmemNetGroupEngine::LinkReconnectHandler()
 {
     if (!option_.dynamic) {
